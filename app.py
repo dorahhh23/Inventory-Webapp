@@ -15,7 +15,7 @@ from inventory_structure_analysis import (
     InventoryStructureAnalyzer,
 )
 
-INVENTORY_ANALYSIS_CACHE_VERSION = "trade-category-pivot-v8"
+INVENTORY_ANALYSIS_CACHE_VERSION = "product-group-share-labels-v14"
 
 
 @st.cache_data(show_spinner="正在读取并分析工作簿…")
@@ -210,57 +210,37 @@ def show_inventory_summary(title: str, frame: pd.DataFrame, summary_type: str) -
                 [label_column, SUMMARY_AMOUNT_COLUMN, SUMMARY_SHARE_COLUMN],
             ].copy()
             secondary_data = secondary_data.sort_values(SUMMARY_AMOUNT_COLUMN, ascending=False, kind="stable")
-            labelled_mask = secondary_data[SUMMARY_AMOUNT_COLUMN].ge(1.0)
+            inside_mask = secondary_data[SUMMARY_SHARE_COLUMN].fillna(0).ge(0.05)
             secondary_data["图内标签"] = [
-                f"{label}<br>{share:.1%}" if show_label else ""
-                for label, share, show_label in zip(
+                f"{label}<br>{share:.1%}" if is_inside else ""
+                for label, share, is_inside in zip(
                     secondary_data[label_column],
                     secondary_data[SUMMARY_SHARE_COLUMN].fillna(0),
-                    labelled_mask,
+                    inside_mask,
                 )
             ]
-
-            def wrap_legend_names(names: list[str], maximum_length: int = 32) -> str:
-                lines: list[str] = []
-                current = ""
-                for name in names:
-                    candidate = f"{current}、{name}" if current else name
-                    if current and len(candidate) > maximum_length:
-                        lines.append(current)
-                        current = name
-                    else:
-                        current = candidate
-                if current:
-                    lines.append(current)
-                return "<br>".join(lines) if lines else "无"
-
-            unlabelled = secondary_data.loc[~labelled_mask]
-            small_one_percent_or_more = unlabelled.loc[
-                unlabelled[SUMMARY_SHARE_COLUMN].ge(0.01), label_column
-            ].astype(str).tolist()
-            below_one_percent = unlabelled.loc[
-                unlabelled[SUMMARY_SHARE_COLUMN].lt(0.01), label_column
-            ].astype(str).tolist()
-            legend_text = (
-                "<b>低于 1 M USD（图中未标出数值）：</b><br>"
-                f"占比1%以上：{wrap_legend_names(small_one_percent_or_more)}<br><br>"
-                f"占比低于1%：{wrap_legend_names(below_one_percent)}"
-            )
+            secondary_data["图例标签"] = [
+                f"{label}  {share:.1%}"
+                for label, share in zip(
+                    secondary_data[label_column], secondary_data[SUMMARY_SHARE_COLUMN].fillna(0)
+                )
+            ]
             secondary_chart = go.Figure(
                 data=[
                     go.Pie(
-                        labels=secondary_data[label_column],
+                        labels=secondary_data["图例标签"],
                         values=secondary_data[SUMMARY_AMOUNT_COLUMN],
                         hole=0.46,
-                        domain=dict(x=[0, 0.68], y=[0, 1]),
+                        domain=dict(x=[0, 0.64], y=[0, 1]),
                         sort=False,
                         direction="clockwise",
                         text=secondary_data["图内标签"],
                         textinfo="text",
                         textposition="inside",
                         insidetextorientation="horizontal",
+                        customdata=secondary_data[label_column],
                         hovertemplate=(
-                            f"{label_column}：%{{label}}<br>"
+                            f"{label_column}：%{{customdata}}<br>"
                             "可用库存金额：%{value:,.2f} M USD<br>"
                             "库存金额占比：%{percent:.2%}<extra></extra>"
                         ),
@@ -269,35 +249,32 @@ def show_inventory_summary(title: str, frame: pd.DataFrame, summary_type: str) -
                 ]
             )
             secondary_chart.update_layout(
-                height=480,
-                margin=dict(l=20, r=30, t=30, b=20),
-                showlegend=False,
+                height=max(520, min(700, 400 + 14 * len(secondary_data))),
+                margin=dict(l=30, r=25, t=45, b=45),
+                showlegend=True,
+                legend=dict(
+                    title=dict(text="产品组（占比）"),
+                    x=0.68,
+                    y=0.5,
+                    xanchor="left",
+                    yanchor="middle",
+                    font=dict(size=11),
+                    traceorder="normal",
+                ),
                 annotations=[
                     dict(
                         text=f"总可用库存金额<br><b>{total_text}</b>",
-                        x=0.34,
+                        x=0.32,
                         y=0.5,
                         xref="paper",
                         yref="paper",
                         showarrow=False,
                         align="center",
                         font=dict(size=14),
-                    ),
-                    dict(
-                        text=legend_text,
-                        x=0.72,
-                        y=0.54,
-                        xref="paper",
-                        yref="paper",
-                        xanchor="left",
-                        yanchor="middle",
-                        showarrow=False,
-                        align="left",
-                        font=dict(size=12),
-                    ),
+                    )
                 ],
             )
-            secondary_tab_label = "1M USD以上标注环形图"
+            secondary_tab_label = "环形图"
         else:
             secondary_chart = go.Figure(
                 data=[
@@ -346,12 +323,167 @@ def show_inventory_summary(title: str, frame: pd.DataFrame, summary_type: str) -
             st.plotly_chart(secondary_chart, use_container_width=True, config={"displayModeBar": False})
 
 
-def show_trade_category_analysis(
-    summaries: dict[str, pd.DataFrame], diagnostics: dict[str, int | float | bool]
+def show_trade_top_eighty_dimension(
+    overview: pd.DataFrame,
+    full_detail: pd.DataFrame,
+    trade_diagnostics: dict[str, object],
+    dimension: str,
 ) -> None:
-    st.markdown("### 按国贸产品分类码分类")
-    overview = summaries["国贸分类码分层"].copy()
-    full_detail = summaries["按国贸分类码汇总"].copy()
+    overview_tab, detail_tab = st.tabs(["前80%分类概览", "数据明细"])
+    with overview_tab:
+        metric_columns = st.columns(3)
+        metric_columns[0].metric(
+            "分组总数", f"{int(trade_diagnostics.get('国贸分类码分组总数', len(full_detail))):,}"
+        )
+        metric_columns[1].metric(
+            "累计达到80%的分组数",
+            f"{int(trade_diagnostics.get('国贸分类码80%覆盖数量', len(overview))):,}",
+        )
+        metric_columns[2].metric(
+            "数据问题分组数", f"{int(trade_diagnostics.get('国贸数据问题数量', 0)):,}"
+        )
+
+        st.write(
+            "由于分类数据呈明显的长尾分布，本页聚焦累计贡献前80%库存金额的分类，"
+            "以突出主要库存构成和关键影响项。 \n ")
+
+        st.caption(
+            "以下分类按可用库存金额从高到低排列，"
+            "并包含累计达到80%所需的最后一个分类。"
+        )
+
+        st.dataframe(
+            overview,
+            column_config={
+                "排名": st.column_config.NumberColumn(format="%d", width="small"),
+                dimension: st.column_config.TextColumn(width="medium"),
+                SUMMARY_AMOUNT_COLUMN: st.column_config.NumberColumn(
+                    "库存金额\n（M USD）", format="%.2f", width="small"
+                ),
+                SUMMARY_SHARE_COLUMN: st.column_config.NumberColumn(format="percent", width="small"),
+                "累计占比": st.column_config.NumberColumn(format="percent", width="small"),
+                "型号数量": st.column_config.NumberColumn(format="%d", width="small"),
+                "单型号库存金额（k USD）": st.column_config.NumberColumn(format="%.2f", width="small"),
+            },
+            use_container_width=True,
+            hide_index=True,
+            key=f"trade-top80-overview-{dimension}",
+        )
+
+        chart_data = overview.copy()
+        amount_values = pd.to_numeric(chart_data[SUMMARY_AMOUNT_COLUMN], errors="coerce")
+        share_values = pd.to_numeric(chart_data[SUMMARY_SHARE_COLUMN], errors="coerce")
+        model_values = pd.to_numeric(chart_data["型号数量"], errors="coerce")
+        bar_labels = [
+            "" if pd.isna(amount) or pd.isna(share) else f"{amount:,.2f} M  |  {share:.1%}"
+            for amount, share in zip(amount_values, share_values)
+        ]
+        pivot_chart = go.Figure()
+        pivot_chart.add_trace(
+            go.Bar(
+                x=amount_values,
+                y=chart_data[dimension],
+                orientation="h",
+                name="库存金额（柱形）",
+                marker_color="#2F75B5",
+                text=bar_labels,
+                textposition="auto",
+                insidetextfont=dict(color="white"),
+                cliponaxis=False,
+                customdata=pd.DataFrame(
+                    {"占比": share_values, "型号数量": model_values}
+                ).to_numpy(),
+                hovertemplate=(
+                    f"{dimension}：%{{y}}<br>"
+                    "库存金额：%{x:,.2f} M USD<br>"
+                    "库存金额占比：%{customdata[0]:.2%}<br>"
+                    "型号数量：%{customdata[1]:,.0f}<extra></extra>"
+                ),
+            )
+        )
+        pivot_chart.add_trace(
+            go.Scatter(
+                x=model_values,
+                y=chart_data[dimension],
+                name="型号数量（点）",
+                mode="markers",
+                marker=dict(
+                    color="#ED7D31", size=11, symbol="diamond", line=dict(color="white", width=1)
+                ),
+                xaxis="x2",
+                hovertemplate=f"{dimension}：%{{y}}<br>型号数量：%{{x:,.0f}}<extra></extra>",
+            )
+        )
+        pivot_chart.update_layout(
+            title="累计前80%分类透视图",
+            height=max(420, 48 * len(chart_data) + 140),
+            margin=dict(l=200, r=60, t=75, b=115),
+            xaxis=dict(title="库存金额（M USD）", tickformat=",.2f", side="top"),
+            xaxis2=dict(
+                title="型号数量", overlaying="x", side="bottom", tickformat=",.0f", showgrid=False
+            ),
+            yaxis=dict(title=None, autorange="reversed"),
+            legend=dict(
+                x=0.99,
+                y=-0.14,
+                xanchor="right",
+                yanchor="top",
+                orientation="h",
+                bgcolor="rgba(255,255,255,0.82)",
+                bordercolor="#D9D9D9",
+                borderwidth=1,
+            ),
+            bargap=0.32,
+        )
+        st.plotly_chart(
+            pivot_chart,
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"trade-top80-pivot-{dimension}",
+        )
+
+    with detail_tab:
+        st.caption("完整分类明细按可用库存金额从高到低排列。")
+        st.write("保留两位小数。双击单元格查看完整数值。")
+        st.dataframe(
+            full_detail,
+            column_config={
+                "排名": st.column_config.NumberColumn(format="%d", width="small"),
+                SUMMARY_AMOUNT_COLUMN: st.column_config.NumberColumn(
+                    "库存金额\n（M USD）", format="%.2f", width="small"
+                ),
+                SUMMARY_SHARE_COLUMN: st.column_config.NumberColumn(format="percent", width="small"),
+                "累计占比": st.column_config.NumberColumn(format="percent", width="small"),
+                "型号数量": st.column_config.NumberColumn(format="%d", width="small"),
+                "单型号库存金额（k USD）": st.column_config.NumberColumn(format="%.2f", width="small"),
+            },
+            use_container_width=True,
+            hide_index=True,
+            key=f"trade-top80-detail-{dimension}",
+        )
+
+
+def show_trade_category_dimension(
+    summaries: dict[str, pd.DataFrame], diagnostics: dict[str, object], dimension: str
+) -> None:
+    overview_key, detail_key = InventoryStructureAnalyzer._trade_keys(dimension)
+    overview = summaries[overview_key].copy()
+    full_detail = summaries[detail_key].copy()
+    diagnostics_by_dimension = diagnostics.get("国贸分类诊断", {})
+    trade_diagnostics = (
+        diagnostics_by_dimension.get(dimension, {})
+        if isinstance(diagnostics_by_dimension, dict)
+        else {}
+    )
+    if not trade_diagnostics:
+        trade_diagnostics = diagnostics
+    if dimension in {
+        "国贸产品分类码L2",
+        "国贸产品分类码L3",
+        "国贸产品分类码L4",
+    }:
+        show_trade_top_eighty_dimension(overview, full_detail, trade_diagnostics, dimension)
+        return
     for frame in (overview, full_detail):
         if "库存分层分类" not in frame.columns and "金额层级" in frame.columns:
             frame.rename(columns={"金额层级": "库存分层分类"}, inplace=True)
@@ -374,9 +506,9 @@ def show_trade_category_analysis(
     overview_tab, detail_tab = st.tabs(["库存分类概览", "数据明细"])
     with overview_tab:
         metric_columns = st.columns(3)
-        metric_columns[0].metric("达到累计80%的分类码", f"{diagnostics['国贸分类码80%覆盖数量']:,}")
-        metric_columns[1].metric("核心及重点分类码（≥0.5 M USD）", f"{diagnostics['国贸重点分类码数量']:,}")
-        metric_columns[2].metric("数据问题分类码", f"{diagnostics['国贸数据问题数量']:,}")
+        metric_columns[0].metric("达到累计80%的分类码", f"{trade_diagnostics['国贸分类码80%覆盖数量']:,}")
+        metric_columns[1].metric("核心及重点分类码（≥0.5 M USD）", f"{trade_diagnostics['国贸重点分类码数量']:,}")
+        metric_columns[2].metric("数据问题分类码", f"{trade_diagnostics['国贸数据问题数量']:,}")
 
         st.dataframe(
             overview,
@@ -392,56 +524,74 @@ def show_trade_category_analysis(
             },
             use_container_width=True,
             hide_index=True,
+            key=f"trade-overview-{dimension}",
         )
 
         tier_data = overview.iloc[:-1].copy()
+        tier_data = tier_data.loc[
+            tier_data[SUMMARY_AMOUNT_COLUMN].notna() | tier_data["型号数量"].notna()
+        ].copy()
         st.markdown("#### 库存分层透视图")
-        share_labels = [
-            "" if pd.isna(share) else f"{share:.1%}"
-            for share in pd.to_numeric(tier_data[SUMMARY_SHARE_COLUMN], errors="coerce")
+        amount_values = pd.to_numeric(tier_data[SUMMARY_AMOUNT_COLUMN], errors="coerce")
+        share_values = pd.to_numeric(tier_data[SUMMARY_SHARE_COLUMN], errors="coerce")
+        model_values = pd.to_numeric(tier_data["型号数量"], errors="coerce")
+        bar_labels = [
+            "" if pd.isna(amount) or pd.isna(share) else f"{amount:,.2f} M  |  {share:.1%}"
+            for amount, share in zip(amount_values, share_values)
         ]
+        tier_colors = {
+            "核心（≥1 M USD）": "#2F75B5",
+            "重点（0.5–1 M USD）": "#5B9BD5",
+            "一般（0.1–0.5 M USD）": "#70AD47",
+            "长尾（0–0.1 M USD）": "#A5A5A5",
+            "负金额": "#C00000",
+        }
         pivot_chart = go.Figure()
         pivot_chart.add_trace(
             go.Bar(
-                x=tier_data["库存分层分类"],
-                y=tier_data[SUMMARY_AMOUNT_COLUMN],
+                x=amount_values,
+                y=tier_data["库存分层分类"],
+                orientation="h",
                 name="库存金额（柱形）",
-                marker_color="#5B9BD5",
-                text=share_labels,
-                textposition="outside",
+                marker_color=[tier_colors.get(value, "#5B9BD5") for value in tier_data["库存分层分类"]],
+                text=bar_labels,
+                textposition="auto",
+                insidetextfont=dict(color="white"),
                 cliponaxis=False,
-                customdata=tier_data[SUMMARY_SHARE_COLUMN],
+                customdata=pd.DataFrame(
+                    {"占比": share_values, "型号数量": model_values}
+                ).to_numpy(),
                 hovertemplate=(
-                    "库存分层分类：%{x}<br>"
-                    "库存金额：%{y:,.2f} M USD<br>"
-                    "库存金额占比：%{customdata:.2%}<extra></extra>"
+                    "库存分层分类：%{y}<br>"
+                    "库存金额：%{x:,.2f} M USD<br>"
+                    "库存金额占比：%{customdata[0]:.2%}<br>"
+                    "型号数量：%{customdata[1]:,.0f}<extra></extra>"
                 ),
             )
         )
         pivot_chart.add_trace(
             go.Scatter(
-                x=tier_data["库存分层分类"],
-                y=tier_data["型号数量"],
-                name="型号数量（点线）",
-                mode="lines+markers",
-                marker=dict(color="#ED7D31", size=8),
-                line=dict(color="#ED7D31", width=2),
-                yaxis="y2",
-                hovertemplate="库存分层分类：%{x}<br>型号数量：%{y:,.0f}<extra></extra>",
+                x=model_values,
+                y=tier_data["库存分层分类"],
+                name="型号数量（点）",
+                mode="markers",
+                marker=dict(color="#ED7D31", size=11, symbol="diamond", line=dict(color="white", width=1)),
+                xaxis="x2",
+                hovertemplate="库存分层分类：%{y}<br>型号数量：%{x:,.0f}<extra></extra>",
             )
         )
         pivot_chart.update_layout(
-            height=460,
-            margin=dict(l=60, r=75, t=35, b=80),
-            xaxis=dict(title="库存分层分类", tickangle=-20),
-            yaxis=dict(title="库存金额（M USD）", tickformat=",.2f"),
-            yaxis2=dict(
+            height=max(360, 70 * len(tier_data) + 100),
+            margin=dict(l=175, r=70, t=70, b=55),
+            xaxis=dict(title="库存金额（M USD）", tickformat=",.2f", side="bottom"),
+            xaxis2=dict(
                 title="型号数量",
-                overlaying="y",
-                side="right",
+                overlaying="x",
+                side="top",
                 tickformat=",.0f",
                 showgrid=False,
             ),
+            yaxis=dict(title=None, autorange="reversed"),
             legend=dict(
                 x=0.99,
                 y=0.99,
@@ -453,7 +603,12 @@ def show_trade_category_analysis(
             ),
             bargap=0.35,
         )
-        st.plotly_chart(pivot_chart, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(
+            pivot_chart,
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"trade-pivot-{dimension}",
+        )
 
     detail_column_config = {
         "排名": st.column_config.NumberColumn(format="%d", width="small"),
@@ -475,7 +630,164 @@ def show_trade_category_analysis(
             column_config=detail_column_config,
             use_container_width=True,
             hide_index=True,
+            key=f"trade-detail-{dimension}",
         )
+
+
+def show_trade_l1_summary(
+    summaries: dict[str, pd.DataFrame], diagnostics: dict[str, object]
+) -> None:
+    frame = summaries["国贸分类码L1汇总"].copy()
+    chart_data = frame.iloc[:-1].copy()
+    chart_data[SUMMARY_AMOUNT_COLUMN] = pd.to_numeric(
+        chart_data[SUMMARY_AMOUNT_COLUMN], errors="coerce"
+    )
+    chart_data[SUMMARY_SHARE_COLUMN] = pd.to_numeric(
+        chart_data[SUMMARY_SHARE_COLUMN], errors="coerce"
+    )
+    chart_data["型号数量"] = pd.to_numeric(chart_data["型号数量"], errors="coerce")
+
+    total_row = frame.iloc[-1]
+    metric_columns = st.columns(3)
+    diagnostics_by_dimension = diagnostics.get("国贸分类诊断", {})
+    l1_diagnostics = (
+        diagnostics_by_dimension.get("国贸产品分类码L1", {})
+        if isinstance(diagnostics_by_dimension, dict)
+        else {}
+    )
+    metric_columns[0].metric(
+        "分组总数", f"{int(l1_diagnostics.get('国贸分类码分组总数', len(chart_data))):,}"
+    )
+    metric_columns[1].metric(
+        "总可用库存金额",
+        f"{pd.to_numeric(total_row[SUMMARY_AMOUNT_COLUMN], errors='coerce'):,.2f} M USD",
+    )
+    metric_columns[2].metric(
+        "型号数量", f"{pd.to_numeric(total_row['型号数量'], errors='coerce'):,.0f}"
+    )
+
+    st.dataframe(
+        frame,
+        column_config={
+            "国贸产品分类码L1": st.column_config.TextColumn(width="medium"),
+            SUMMARY_AMOUNT_COLUMN: st.column_config.NumberColumn(
+                "库存金额\n（M USD）", format="%.2f", width="small"
+            ),
+            SUMMARY_SHARE_COLUMN: st.column_config.NumberColumn(format="percent", width="small"),
+            "型号数量": st.column_config.NumberColumn(format="%d", width="small"),
+            "单型号库存金额（k USD）": st.column_config.NumberColumn(format="%.2f", width="small"),
+        },
+        use_container_width=True,
+        hide_index=True,
+        key="trade-l1-summary",
+    )
+
+    chart_data = chart_data.sort_values(
+        SUMMARY_AMOUNT_COLUMN, ascending=True, na_position="first", kind="stable"
+    )
+    labels = [
+        "" if pd.isna(amount) or pd.isna(share) else f"{amount:,.2f} M  |  {share:.1%}"
+        for amount, share in zip(chart_data[SUMMARY_AMOUNT_COLUMN], chart_data[SUMMARY_SHARE_COLUMN])
+    ]
+    bar_chart = go.Figure(
+        go.Bar(
+            x=chart_data[SUMMARY_AMOUNT_COLUMN],
+            y=chart_data["国贸产品分类码L1"],
+            orientation="h",
+            marker_color="#2F75B5",
+            text=labels,
+            textposition="auto",
+            insidetextfont=dict(color="white"),
+            cliponaxis=False,
+            customdata=chart_data[[SUMMARY_SHARE_COLUMN, "型号数量"]].to_numpy(),
+            hovertemplate=(
+                "L1分类：%{y}<br>库存金额：%{x:,.2f} M USD<br>"
+                "库存金额占比：%{customdata[0]:.2%}<br>型号数量：%{customdata[1]:,.0f}<extra></extra>"
+            ),
+        )
+    )
+    bar_chart.update_layout(
+        height=max(360, 62 * len(chart_data) + 100),
+        margin=dict(l=190, r=80, t=30, b=55),
+        xaxis=dict(title="库存金额（M USD）", tickformat=",.2f"),
+        yaxis=dict(title=None),
+        showlegend=False,
+    )
+
+    pie_data = chart_data.loc[chart_data[SUMMARY_AMOUNT_COLUMN].gt(0)].sort_values(
+        SUMMARY_AMOUNT_COLUMN, ascending=False, kind="stable"
+    )
+    pie_positions = [
+        "inside" if share >= 0.03 else "outside"
+        for share in pie_data[SUMMARY_SHARE_COLUMN].fillna(0)
+    ]
+    pie_labels = [
+        f"{category}<br>{share:.1%}" if share >= 0.01 else f"{share:.1%}"
+        for category, share in zip(
+            pie_data["国贸产品分类码L1"], pie_data[SUMMARY_SHARE_COLUMN].fillna(0)
+        )
+    ]
+    pie_chart = go.Figure(
+        go.Pie(
+            labels=pie_data["国贸产品分类码L1"],
+            values=pie_data[SUMMARY_AMOUNT_COLUMN],
+            sort=False,
+            text=pie_labels,
+            textinfo="text",
+            textposition=pie_positions,
+            insidetextorientation="horizontal",
+            automargin=True,
+            hovertemplate=(
+                "L1分类：%{label}<br>库存金额：%{value:,.2f} M USD<br>"
+                "库存金额占比：%{percent:.2%}<extra></extra>"
+            ),
+        )
+    )
+    pie_chart.update_layout(
+        height=500,
+        margin=dict(l=45, r=185, t=70, b=45),
+        showlegend=True,
+        legend=dict(x=1.02, y=0.5, xanchor="left", yanchor="middle"),
+        uniformtext_minsize=10,
+        uniformtext_mode="hide",
+    )
+
+    bar_tab, pie_tab = st.tabs(["柱状图", "饼图"])
+    with bar_tab:
+        st.plotly_chart(
+            bar_chart,
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key="trade-l1-bar",
+        )
+    with pie_tab:
+        st.plotly_chart(
+            pie_chart,
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key="trade-l1-pie",
+        )
+
+
+def show_trade_category_analysis(
+    summaries: dict[str, pd.DataFrame], diagnostics: dict[str, object]
+) -> None:
+    st.markdown("### 按国贸产品分类码分类")
+    dimensions = list(diagnostics.get("国贸分类维度", ("国贸产品分类码",)))
+    if len(dimensions) == 1:
+        if dimensions[0] == "国贸产品分类码L1":
+            show_trade_l1_summary(summaries, diagnostics)
+        else:
+            show_trade_category_dimension(summaries, diagnostics, dimensions[0])
+        return
+
+    level_tabs = st.tabs([dimension.removeprefix("国贸产品分类码") for dimension in dimensions])
+    for tab, dimension in zip(level_tabs, dimensions):
+        with tab:
+            if dimension == "国贸产品分类码L1":
+                show_trade_l1_summary(summaries, diagnostics)
+            else:
+                show_trade_category_dimension(summaries, diagnostics, dimension)
 
 
 def render_inventory_page() -> None:
@@ -484,7 +796,7 @@ def render_inventory_page() -> None:
     st.markdown("### 1. 上传文件")
     replenishment_column, price_area = st.columns(2, gap="large")
     with replenishment_column:
-        replenishment_file = st.file_uploader("Replenishment 表（两行表头）", type=["xlsx"], key="inventory_replenishment")
+        replenishment_file = st.file_uploader("Replenishment 表", type=["xlsx"], key="inventory_replenishment")
     with price_area:
         price_file = st.file_uploader("价格表", type=["xlsx"], key="inventory_prices")
     if replenishment_file is None or price_file is None:
@@ -599,7 +911,12 @@ def render_inventory_page() -> None:
     for tab, name in zip(st.tabs(names), names):
         with tab:
             with st.expander(f"展开查看{name}明细", expanded=False):
-                st.dataframe(result.views[name].style.format(precision=2, na_rep=""), use_container_width=True, hide_index=True)
+                web_detail = result.views[name].drop(columns=["销售组织"], errors="ignore")
+                st.dataframe(
+                    web_detail.style.format(precision=2, na_rep=""),
+                    use_container_width=True,
+                    hide_index=True,
+                )
                 if name == "正常及关注库存":
                     st.caption("无法计算存销比的记录标记为“数据问题”，并显示在表格最后。")
     st.markdown("### 5. 汇总分析")
@@ -618,7 +935,7 @@ def render_inventory_page() -> None:
 
 
 st.set_page_config(page_title="补货与库存分析", page_icon="📦", layout="wide")
-page = st.sidebar.radio("一级页面选择：", ["补货预测异常识别", "库存结构分析"])
+page = st.sidebar.radio("页面选择：", ["补货预测异常识别", "库存结构分析"])
 if page == "补货预测异常识别":
     render_anomaly_page()
 else:

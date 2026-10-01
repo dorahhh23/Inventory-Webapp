@@ -55,6 +55,7 @@ class InventoryStructureAnalyzerTests(unittest.TestCase):
         result = self.analyze([row("A", stock=90, forecast=10, revised=30)])
         self.assertEqual(result.detail.loc[0, "有效预测月销"], 30)
         self.assertEqual(result.detail.loc[0, "可用库存存销比"], 3)
+        self.assertAlmostEqual(result.detail.loc[0, "全供应链存销比"], 95 / 30)
 
     def test_price_columns_are_auto_detected_only_from_known_names(self):
         recognized = pd.DataFrame({"物料代码": ["A"], "销售组织": [8374], "单价": [2.5]})
@@ -63,6 +64,77 @@ class InventoryStructureAnalyzerTests(unittest.TestCase):
         unrecognized = pd.DataFrame({"物料代码": ["A"], "销售组织": [8374]})
         self.assertEqual(self.analyzer.detect_price_columns(unrecognized), ("物料代码", None))
 
+    def test_new_replenishment_headers_use_l1_to_l4_without_full_chain_ratio(self):
+        source = replenishment([row("A", stock=90, forecast=15), row("B", stock=120, forecast=20)])
+        source = source.drop(
+            columns=[
+                ("产品基本信息", "国贸产品分类码"),
+                ("服务水平信息", "全供应链存销比"),
+            ]
+        )
+        for level, values in {
+            "L1": ["一级A", "一级B"],
+            "L2": ["二级A", "二级B"],
+            "L3": ["三级A", "三级B"],
+            "L4": ["四级A", "四级B"],
+        }.items():
+            source[("实际销量", f"国贸产品分类码{level}")] = values
+
+        prices = pd.DataFrame({"物料代码": ["A", "B"], "单价": [2, 2]})
+        result = self.analyzer.analyze(source, prices)
+
+        self.assertEqual(
+            result.diagnostics["国贸分类维度"],
+            ("国贸产品分类码L1", "国贸产品分类码L2", "国贸产品分类码L3", "国贸产品分类码L4"),
+        )
+        self.assertEqual(result.detail["全供应链存销比"].tolist(), [95 / 15, 125 / 20])
+        self.assertEqual(result.detail["可用库存存销比"].tolist(), [6.0, 6.0])
+        for level in ["L2", "L3", "L4"]:
+            self.assertIn(f"国贸分类码{level}前80%", result.summaries)
+            self.assertIn(f"国贸分类码{level}明细", result.summaries)
+            self.assertEqual(
+                result.diagnostics["国贸分类诊断"][f"国贸产品分类码{level}"]["国贸分类码分组总数"],
+                2,
+            )
+        self.assertIn("国贸分类码L1汇总", result.summaries)
+        self.assertNotIn("国贸分类码L1分层", result.summaries)
+        self.assertNotIn("国贸分类码L1明细", result.summaries)
+
+        workbook = openpyxl.load_workbook(io.BytesIO(self.analyzer.export_excel(result)))
+        expected_trade_sheets = ["国贸分类码L1汇总"] + [
+            f"国贸分类码{level}明细" for level in ["L2", "L3", "L4"]
+        ]
+        self.assertEqual(workbook.sheetnames, SHEET_NAMES[:5] + expected_trade_sheets)
+        self.assertEqual(len(workbook["国贸分类码L1汇总"]._charts), 2)
+        for level in ["L2", "L3", "L4"]:
+            self.assertNotIn(f"国贸分类码{level}前80%", workbook.sheetnames)
+            self.assertEqual(len(workbook[f"国贸分类码{level}明细"]._charts), 2)
+
+    def test_l2_top_eighty_overview_uses_categories_not_amount_tiers(self):
+        source = replenishment(
+            [
+                row("A", stock=40_000_000),
+                row("B", stock=30_000_000),
+                row("C", stock=20_000_000),
+                row("D", stock=10_000_000),
+            ]
+        ).drop(columns=[("产品基本信息", "国贸产品分类码")])
+        source[("实际销量", "国贸产品分类码L2")] = ["二级A", "二级B", "二级C", "二级D"]
+        prices = pd.DataFrame({"物料代码": list("ABCD"), "单价": [1, 1, 1, 1]})
+
+        result = self.analyzer.analyze(source, prices)
+        overview = result.summaries["国贸分类码L2前80%"]
+        detail = result.summaries["国贸分类码L2明细"]
+
+        self.assertEqual(overview["国贸产品分类码L2"].tolist(), ["二级A", "二级B", "二级C"])
+        self.assertAlmostEqual(overview.iloc[-1]["累计占比"], 0.9)
+        self.assertNotIn("库存分层分类", overview.columns)
+        self.assertNotIn("库存分层分类", detail.columns)
+        self.assertEqual(
+            result.diagnostics["国贸分类诊断"]["国贸产品分类码L2"]["国贸分类码分组总数"],
+            4,
+        )
+
     def test_only_parent_level_is_included_in_all_analysis(self):
         result = self.analyze([row("A", level=" parent "), row("B", level="SON"), row("C", level=np.nan)])
         self.assertEqual(result.detail["物料"].tolist(), ["A"])
@@ -70,6 +142,18 @@ class InventoryStructureAnalyzerTests(unittest.TestCase):
         self.assertEqual(result.diagnostics["纳入Parent记录数"], 1)
         self.assertEqual(result.diagnostics["忽略非Parent记录数"], 2)
         self.assertEqual(result.summaries["按产品状态汇总"].iloc[-1]["型号数量"], 1)
+
+    def test_sales_organization_is_first_column_in_inventory_excel_sheets(self):
+        source = replenishment([row("A", stock=250)])
+        source[("快照日期", "销售组织")] = ["EU01"]
+        result = self.analyzer.analyze(
+            source, pd.DataFrame({"物料代码": ["A"], "单价": [2]})
+        )
+
+        workbook = openpyxl.load_workbook(io.BytesIO(self.analyzer.export_excel(result)))
+        for sheet_name in SHEET_NAMES[:3]:
+            self.assertEqual(workbook[sheet_name]["A1"].value, "销售组织")
+        self.assertEqual(workbook["库存24个月以上"]["A2"].value, "EU01")
 
     def test_original_forecast_used_when_revised_is_empty(self):
         result = self.analyze([row("A", stock=90, forecast=15)])
@@ -95,6 +179,7 @@ class InventoryStructureAnalyzerTests(unittest.TestCase):
     def test_nonpositive_forecast_does_not_divide_by_zero(self):
         result = self.analyze([row("A", forecast=0), row("B", forecast=-2)])
         self.assertTrue(result.detail["可用库存存销比"].isna().all())
+        self.assertTrue(result.detail["全供应链存销比"].isna().all())
         self.assertTrue(result.detail["计算状态"].str.contains("无有效销量").all())
         self.assertTrue(result.detail["库存区间"].eq("数据问题").all())
 
@@ -225,10 +310,16 @@ class InventoryStructureAnalyzerTests(unittest.TestCase):
         self.assertEqual(type(charts[1]).__name__, "DoughnutChart")
 
         with zipfile.ZipFile(io.BytesIO(excel_bytes)) as archive:
-            chart_xml = "".join(
+            chart_xml_documents = [
                 archive.read(name).decode("utf-8")
                 for name in archive.namelist()
                 if name.startswith("xl/charts/chart")
+            ]
+            chart_xml = "".join(chart_xml_documents)
+            product_group_doughnut_xml = next(
+                xml
+                for xml in chart_xml_documents
+                if "<c:doughnutChart>" in xml and "Large Group" in xml
             )
             drawing_xml = "".join(
                 archive.read(name).decode("utf-8")
@@ -237,11 +328,12 @@ class InventoryStructureAnalyzerTests(unittest.TestCase):
             )
         self.assertIn("Large Group", chart_xml)
         self.assertIn("Outside Label Group", chart_xml)
-        self.assertIn("<c:dLblPos val=\"outEnd\"/>", chart_xml)
-        self.assertIn("<c:showLeaderLines val=\"1\"/>", chart_xml)
-        self.assertIn("<c:delete val=\"1\"/>", chart_xml)
+        self.assertNotIn("<c:dLblPos val=\"outEnd\"/>", product_group_doughnut_xml)
+        self.assertIn("<c:legendPos val=\"r\"/>", product_group_doughnut_xml)
+        self.assertIn("<c:delete val=\"1\"/>", product_group_doughnut_xml)
+        self.assertIn("Unlabelled Group", chart_xml)
         self.assertIn("总可用库存金额", drawing_xml)
-        self.assertIn("低于 1 M USD", drawing_xml)
+        self.assertNotIn("低于 1 M USD", drawing_xml)
 
     def test_excel_accepts_legacy_trade_tier_column_name(self):
         result = self.analyze([row("A", stock=2_000_000), row("B", stock=750_000)])

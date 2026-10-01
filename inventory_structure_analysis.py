@@ -10,6 +10,7 @@ import pandas as pd
 
 
 DETAIL_COLUMNS = [
+    "销售组织",
     "物料",
     "物料描述",
     "产品状态",
@@ -27,6 +28,14 @@ DETAIL_COLUMNS = [
     "可用库存金额",
     "库存区间",
     "计算状态",
+]
+
+TRADE_CATEGORY_FIELDS = [
+    "国贸产品分类码",
+    "国贸产品分类码L1",
+    "国贸产品分类码L2",
+    "国贸产品分类码L3",
+    "国贸产品分类码L4",
 ]
 
 SUMMARY_AMOUNT_COLUMN = "可用库存金额（M USD）"
@@ -49,19 +58,24 @@ class InventoryAnalysisResult:
     views: dict[str, pd.DataFrame]
     summaries: dict[str, pd.DataFrame]
     field_mapping: dict[str, str]
-    diagnostics: dict[str, int | float | bool]
+    diagnostics: dict[str, object]
 
 
 class InventoryStructureAnalyzer:
     """Analyze available-stock structure without mutating the uploaded workbooks."""
 
     FIELD_ALIASES = {
+        "销售组织": ["销售组织", "salesorganization", "salesorg"],
         "物料": ["物料", "物料代码", "material", "materialcode", "sku"],
         "物料描述": ["物料描述", "产品描述", "materialdescription", "description"],
         "产品状态": ["产品状态", "productstatus"],
         "产品组": ["产品组", "productgroup", "productgroupcode"],
         "产品组描述": ["产品组描述", "productgroupdescription", "productgroupdesc"],
         "国贸产品分类码": ["国贸产品分类码", "产品分类码", "internationalproductclassificationcode"],
+        "国贸产品分类码L1": ["国贸产品分类码L1", "产品分类码L1"],
+        "国贸产品分类码L2": ["国贸产品分类码L2", "产品分类码L2"],
+        "国贸产品分类码L3": ["国贸产品分类码L3", "产品分类码L3"],
+        "国贸产品分类码L4": ["国贸产品分类码L4", "产品分类码L4"],
         "级别": ["级别", "层级", "level", "hierarchylevel"],
         "当前库存等级": ["当前库存等级", "currentstocklevel", "currentstockgrade"],
         "目标库存月数": ["库存月数", "目标库存月数", "targetinventorymonths", "targetmos"],
@@ -110,10 +124,33 @@ class InventoryStructureAnalyzer:
             if candidates:
                 mapping[canonical] = candidates[0]
                 used.add(candidates[0])
-        missing = [name for name in self.FIELD_ALIASES if name not in mapping]
+        optional_fields = {*TRADE_CATEGORY_FIELDS, "全供应链存销比", "销售组织"}
+        missing = [name for name in self.FIELD_ALIASES if name not in mapping and name not in optional_fields]
         if missing:
             raise ValueError("Replenishment 表缺少必要字段：" + "、".join(missing))
+        if "国贸产品分类码" not in mapping and not any(
+            name in mapping for name in TRADE_CATEGORY_FIELDS[1:]
+        ):
+            raise ValueError(
+                "Replenishment 表缺少国贸分类字段：请提供“国贸产品分类码”，或至少提供国贸产品分类码L1-L4中的一列。"
+            )
         return mapping
+
+    @staticmethod
+    def _trade_keys(dimension: str) -> tuple[str, str]:
+        if dimension == "国贸产品分类码":
+            return "国贸分类码分层", "按国贸分类码汇总"
+        level = dimension.removeprefix("国贸产品分类码")
+        if level in {"L2", "L3", "L4"}:
+            return f"国贸分类码{level}前80%", f"国贸分类码{level}明细"
+        return f"国贸分类码{level}分层", f"国贸分类码{level}明细"
+
+    @staticmethod
+    def _detail_columns(trade_dimensions: list[str]) -> list[str]:
+        columns = DETAIL_COLUMNS.copy()
+        category_index = columns.index("国贸产品分类码")
+        columns[category_index : category_index + 1] = trade_dimensions
+        return columns
 
     def detect_price_columns(self, frame: pd.DataFrame) -> tuple[Hashable | None, Hashable | None]:
         def find(aliases: list[str]) -> Hashable | None:
@@ -176,6 +213,16 @@ class InventoryStructureAnalyzer:
             raise ValueError("无法识别价格表中的物料代码列或单价列，请在页面中手动选择。")
 
         detail = pd.DataFrame({name: replenishment[column] for name, column in field_map.items()})
+        trade_dimensions = (
+            ["国贸产品分类码"]
+            if "国贸产品分类码" in field_map
+            else [name for name in TRADE_CATEGORY_FIELDS[1:] if name in field_map]
+        )
+        detail_columns = self._detail_columns(trade_dimensions)
+        if "销售组织" not in detail.columns:
+            detail["销售组织"] = pd.NA
+        if "全供应链存销比" not in detail.columns:
+            detail["全供应链存销比"] = np.nan
         source_record_count = len(detail)
         parent_mask = detail["级别"].astype("string").str.strip().str.casefold().eq("parent").fillna(False)
         detail = detail.loc[parent_mask].copy().reset_index(drop=True)
@@ -191,6 +238,17 @@ class InventoryStructureAnalyzer:
             detail[column] = pd.to_numeric(detail[column], errors="coerce")
 
         detail["有效预测月销"] = detail["_修改预测"].where(detail["_修改预测"].notna(), detail["_原预测"])
+        valid_full_chain_ratio = (
+            detail["当前可用库存"].notna()
+            & detail["在途+在产"].notna()
+            & detail["有效预测月销"].gt(0)
+        )
+        detail["全供应链存销比"] = np.where(
+            valid_full_chain_ratio,
+            (detail["当前可用库存"] + detail["在途+在产"])
+            / detail["有效预测月销"],
+            np.nan,
+        )
         statuses: list[list[str]] = [[] for _ in range(len(detail))]
 
         stock_missing = detail["当前可用库存"].isna()
@@ -225,7 +283,7 @@ class InventoryStructureAnalyzer:
         detail["可用库存金额"] = detail["当前可用库存"] * detail["单价"]
         detail["计算状态"] = ["；".join(items) if items else "正常" for items in statuses]
 
-        detail = detail[DETAIL_COLUMNS + ["_物料键"]]
+        detail = detail[detail_columns + ["_物料键"]]
         views = {
             "库存24个月以上": self._sorted(detail.loc[detail["库存区间"].eq("库存24个月以上")]),
             "超目标库存": self._sorted(detail.loc[detail["库存区间"].eq("超目标库存")]),
@@ -233,17 +291,56 @@ class InventoryStructureAnalyzer:
         normal = detail.loc[detail["库存区间"].eq("正常及关注库存")]
         problems = detail.loc[detail["库存区间"].eq("数据问题")]
         views["正常及关注库存"] = pd.concat([self._sorted(normal), self._sorted(problems)], ignore_index=True)
-        views = {name: frame[DETAIL_COLUMNS].copy() for name, frame in views.items()}
+        views = {name: frame[detail_columns].copy() for name, frame in views.items()}
 
         summaries = {
             "按产品状态汇总": self._summarize(detail, ["产品状态"]),
             "按产品组汇总": self._summarize(detail, ["产品组", "产品组描述"]),
-            "按国贸分类码汇总": self._summarize(detail, ["国贸产品分类码"]),
         }
-        trade_tables, trade_diagnostics = self._build_trade_category_tables(
-            summaries["按国贸分类码汇总"]
-        )
-        summaries.update(trade_tables)
+        trade_diagnostics_by_dimension: dict[str, dict[str, int]] = {}
+        for dimension in trade_dimensions:
+            overview_key, detail_key = self._trade_keys(dimension)
+            trade_summary = self._summarize(detail, [dimension])
+            if dimension == "国贸产品分类码L1":
+                l1_summary = trade_summary.copy()
+                l1_summary["单型号库存金额（k USD）"] = np.where(
+                    pd.to_numeric(l1_summary["型号数量"], errors="coerce").gt(0),
+                    pd.to_numeric(l1_summary[SUMMARY_AMOUNT_COLUMN], errors="coerce")
+                    * 1000
+                    / pd.to_numeric(l1_summary["型号数量"], errors="coerce"),
+                    np.nan,
+                )
+                summaries["国贸分类码L1汇总"] = l1_summary
+                l1_detail = l1_summary.iloc[:-1]
+                trade_diagnostics_by_dimension[dimension] = {
+                    "国贸分类码分组总数": int(len(l1_detail)),
+                    "国贸数据问题数量": int(
+                        pd.to_numeric(l1_detail[SUMMARY_AMOUNT_COLUMN], errors="coerce").isna().sum()
+                    ),
+                }
+                continue
+            if dimension in {
+                "国贸产品分类码L2",
+                "国贸产品分类码L3",
+                "国贸产品分类码L4",
+            }:
+                trade_tables, trade_diagnostics = self._build_trade_top_eighty_tables(
+                    trade_summary,
+                    dimension,
+                    overview_key,
+                    detail_key,
+                )
+                summaries.update(trade_tables)
+                trade_diagnostics_by_dimension[dimension] = trade_diagnostics
+                continue
+            trade_tables, trade_diagnostics = self._build_trade_category_tables(
+                trade_summary,
+                dimension,
+                overview_key,
+                detail_key,
+            )
+            summaries.update(trade_tables)
+            trade_diagnostics_by_dimension[dimension] = trade_diagnostics
         detail_amount = detail["可用库存金额"].sum(min_count=1)
         summary_amount_musd = summaries["按产品状态汇总"].iloc[-1][SUMMARY_AMOUNT_COLUMN]
         summary_amount = summary_amount_musd * 1_000_000
@@ -261,12 +358,15 @@ class InventoryStructureAnalyzer:
             "数据问题数量": int(detail.loc[detail["库存区间"].eq("数据问题"), "_物料键"].nunique(dropna=True)),
             "有效明细金额": float(detail_amount) if pd.notna(detail_amount) else np.nan,
             "汇总金额核对一致": amounts_match,
-            **trade_diagnostics,
+            "国贸分类维度": tuple(trade_dimensions),
+            "国贸分类诊断": trade_diagnostics_by_dimension,
         }
+        if trade_dimensions == ["国贸产品分类码"]:
+            diagnostics.update(trade_diagnostics_by_dimension["国贸产品分类码"])
         readable_mapping = {name: self._display_column(column) for name, column in field_map.items()}
         readable_mapping["价格表物料代码"] = self._display_column(price_material_column)
         readable_mapping["价格表单价"] = self._display_column(price_column)
-        return InventoryAnalysisResult(detail[DETAIL_COLUMNS].copy(), views, summaries, readable_mapping, diagnostics)
+        return InventoryAnalysisResult(detail[detail_columns].copy(), views, summaries, readable_mapping, diagnostics)
 
     @staticmethod
     def _sorted(frame: pd.DataFrame) -> pd.DataFrame:
@@ -306,6 +406,9 @@ class InventoryStructureAnalyzer:
     @staticmethod
     def _build_trade_category_tables(
         summary: pd.DataFrame,
+        dimension: str,
+        overview_key: str,
+        detail_key: str,
     ) -> tuple[dict[str, pd.DataFrame], dict[str, int]]:
         total_amount = pd.to_numeric(summary.iloc[-1][SUMMARY_AMOUNT_COLUMN], errors="coerce")
         total_models = pd.to_numeric(summary.iloc[-1]["型号数量"], errors="coerce")
@@ -358,7 +461,7 @@ class InventoryStructureAnalyzer:
 
         detail_columns = [
             "排名",
-            "国贸产品分类码",
+            dimension,
             SUMMARY_AMOUNT_COLUMN,
             SUMMARY_SHARE_COLUMN,
             "累计占比",
@@ -420,11 +523,85 @@ class InventoryStructureAnalyzer:
         )
         return (
             {
-                "国贸分类码分层": overview,
-                "按国贸分类码汇总": full_detail,
+                overview_key: overview,
+                detail_key: full_detail,
             },
             {
                 "国贸重点分类码数量": int(full_detail[SUMMARY_AMOUNT_COLUMN].ge(0.5).sum()),
+                "国贸数据问题数量": int(full_detail["数据状态"].ne("正常").sum()),
+                "国贸分类码80%覆盖数量": coverage_count,
+            },
+        )
+
+    @staticmethod
+    def _build_trade_top_eighty_tables(
+        summary: pd.DataFrame,
+        dimension: str,
+        overview_key: str,
+        detail_key: str,
+    ) -> tuple[dict[str, pd.DataFrame], dict[str, int]]:
+        detail = summary.iloc[:-1].copy()
+        detail[SUMMARY_AMOUNT_COLUMN] = pd.to_numeric(
+            detail[SUMMARY_AMOUNT_COLUMN], errors="coerce"
+        )
+        detail[SUMMARY_SHARE_COLUMN] = pd.to_numeric(
+            detail[SUMMARY_SHARE_COLUMN], errors="coerce"
+        )
+        detail["型号数量"] = pd.to_numeric(detail["型号数量"], errors="coerce")
+        detail = detail.sort_values(
+            SUMMARY_AMOUNT_COLUMN, ascending=False, na_position="last", kind="stable"
+        ).reset_index(drop=True)
+
+        positive = detail[SUMMARY_AMOUNT_COLUMN].gt(0)
+        detail["排名"] = pd.Series(pd.NA, index=detail.index, dtype="Int64")
+        detail.loc[positive, "排名"] = range(1, int(positive.sum()) + 1)
+        detail["累计占比"] = np.nan
+        detail.loc[positive, "累计占比"] = (
+            detail.loc[positive, SUMMARY_SHARE_COLUMN].fillna(0).cumsum()
+        )
+        detail["单型号库存金额（k USD）"] = np.where(
+            detail["型号数量"].gt(0),
+            detail[SUMMARY_AMOUNT_COLUMN] * 1000 / detail["型号数量"],
+            np.nan,
+        )
+        detail["数据状态"] = np.select(
+            [
+                detail[SUMMARY_AMOUNT_COLUMN].isna(),
+                detail[SUMMARY_AMOUNT_COLUMN].lt(0),
+                detail[SUMMARY_AMOUNT_COLUMN].ge(0) & detail[SUMMARY_AMOUNT_COLUMN].lt(0.005),
+            ],
+            ["金额缺失", "负库存金额", "金额接近零"],
+            default="正常",
+        )
+
+        detail_columns = [
+            "排名",
+            dimension,
+            SUMMARY_AMOUNT_COLUMN,
+            SUMMARY_SHARE_COLUMN,
+            "累计占比",
+            "型号数量",
+            "单型号库存金额（k USD）",
+            "数据状态",
+        ]
+        full_detail = detail[detail_columns].copy()
+        positive_cumulative = full_detail.loc[
+            full_detail[SUMMARY_AMOUNT_COLUMN].gt(0), "累计占比"
+        ]
+        reaches_eighty = positive_cumulative.ge(0.8)
+        coverage_count = (
+            int(np.flatnonzero(reaches_eighty.to_numpy())[0] + 1)
+            if reaches_eighty.any()
+            else int(len(positive_cumulative))
+        )
+        top_eighty = full_detail.loc[
+            full_detail[SUMMARY_AMOUNT_COLUMN].gt(0)
+        ].iloc[:coverage_count].reset_index(drop=True)
+
+        return (
+            {overview_key: top_eighty, detail_key: full_detail},
+            {
+                "国贸分类码分组总数": int(len(full_detail)),
                 "国贸数据问题数量": int(full_detail["数据状态"].ne("正常").sum()),
                 "国贸分类码80%覆盖数量": coverage_count,
             },
@@ -443,14 +620,34 @@ class InventoryStructureAnalyzer:
             percent_format = workbook.add_format({"num_format": "0.00%"})
             warning_format = workbook.add_format({"bg_color": "#FFF2CC"})
             negative_format = workbook.add_format({"bg_color": "#FCE8E6", "font_color": "#9C0006"})
+            chart_scale = 2 / 3
 
             frames = {**result.views, **result.summaries}
-            for sheet_name in SHEET_NAMES:
+            trade_dimensions = list(result.diagnostics.get("国贸分类维度", ("国贸产品分类码",)))
+            trade_sheet_dimensions: dict[str, str] = {}
+            sheet_names = SHEET_NAMES[:5].copy()
+            for dimension in trade_dimensions:
+                if dimension == "国贸产品分类码L1":
+                    sheet_names.append("国贸分类码L1汇总")
+                    continue
+                overview_key, detail_key = self._trade_keys(dimension)
+                if dimension in {
+                    "国贸产品分类码L2",
+                    "国贸产品分类码L3",
+                    "国贸产品分类码L4",
+                }:
+                    sheet_names.append(detail_key)
+                else:
+                    sheet_names.extend([overview_key, detail_key])
+                    trade_sheet_dimensions[overview_key] = dimension
+                trade_sheet_dimensions[detail_key] = dimension
+
+            for sheet_name in sheet_names:
                 frame = frames[sheet_name].copy()
-                if sheet_name in {"国贸分类码分层", "按国贸分类码汇总"}:
+                if sheet_name in trade_sheet_dimensions:
                     if "库存分层分类" not in frame.columns and "金额层级" in frame.columns:
                         frame = frame.rename(columns={"金额层级": "库存分层分类"})
-                    if sheet_name == "国贸分类码分层" and "库存分层分类" in frame.columns:
+                    if sheet_name == self._trade_keys(trade_sheet_dimensions[sheet_name])[0] and "库存分层分类" in frame.columns:
                         valid_tiers = {
                             "核心（≥1 M USD）",
                             "重点（0.5–1 M USD）",
@@ -533,7 +730,12 @@ class InventoryStructureAnalyzer:
                     chart.set_title({"name": sheet_name})
                     chart.set_y_axis({"name": "M USD", "num_format": "#,##0.00"})
                     chart.set_legend({"none": True})
-                    worksheet.insert_chart(1, len(frame.columns) + 1, chart, {"x_scale": 1.35, "y_scale": 1.2})
+                    worksheet.insert_chart(
+                        1,
+                        len(frame.columns) + 1,
+                        chart,
+                        {"x_scale": 1.35 * chart_scale, "y_scale": 1.2 * chart_scale},
+                    )
 
                     total_amount = frame.iloc[-1][SUMMARY_AMOUNT_COLUMN]
                     total_text = "—" if pd.isna(total_amount) else f"{total_amount:,.2f} M USD"
@@ -543,15 +745,17 @@ class InventoryStructureAnalyzer:
                         for _, chart_row in chart_rows.iterrows():
                             amount = pd.to_numeric(chart_row[SUMMARY_AMOUNT_COLUMN], errors="coerce")
                             share = pd.to_numeric(chart_row[SUMMARY_SHARE_COLUMN], errors="coerce")
-                            if pd.notna(amount) and amount >= 1:
+                            if pd.notna(amount) and amount > 0 and pd.notna(share):
                                 share_text = "—" if pd.isna(share) else f"{share:.1%}"
                                 is_large_slice = pd.notna(share) and share >= 0.05
                                 custom_labels.append(
                                     {
                                         "value": f"{chart_row.iloc[category_column]}\n{share_text}",
-                                        "position": "center" if is_large_slice else "outside_end",
-                                        "font": {"size": 9 if is_large_slice else 8},
+                                        "position": "center",
+                                        "font": {"size": 9},
                                     }
+                                    if is_large_slice
+                                    else {"delete": True}
                                 )
                             else:
                                 custom_labels.append({"delete": True})
@@ -564,48 +768,27 @@ class InventoryStructureAnalyzer:
                                 "values": [sheet_name, 1, amount_column, len(frame) - 1, amount_column],
                                 "data_labels": {
                                     "custom": custom_labels,
-                                    "leader_lines": True,
                                 },
                             }
                         )
                         doughnut_chart.set_hole_size(46)
                         doughnut_chart.set_title({"name": "按产品组汇总"})
-                        doughnut_chart.set_legend({"none": True})
+                        doughnut_chart.set_legend({"position": "right"})
                         chart_start_column = len(frame.columns) + 1
                         worksheet.insert_chart(
                             20,
                             chart_start_column,
                             doughnut_chart,
-                            {"x_scale": 1.65, "y_scale": 1.55},
+                            {"x_scale": 1.65 * chart_scale, "y_scale": 1.55 * chart_scale},
                         )
 
-                        unlabelled = chart_rows.loc[
-                            pd.to_numeric(chart_rows[SUMMARY_AMOUNT_COLUMN], errors="coerce").lt(1)
-                        ].copy()
-                        above_one_percent = unlabelled.loc[
-                            pd.to_numeric(unlabelled[SUMMARY_SHARE_COLUMN], errors="coerce").ge(0.01)
-                        ]
-                        below_one_percent = unlabelled.loc[
-                            pd.to_numeric(unlabelled[SUMMARY_SHARE_COLUMN], errors="coerce").lt(0.01)
-                        ]
-
-                        def joined_names(rows: pd.DataFrame) -> str:
-                            names = rows.iloc[:, category_column].dropna().astype(str).tolist()
-                            return "、".join(names) if names else "无"
-
-                        legend_text = (
-                            f"总可用库存金额\n{total_text}\n\n"
-                            "低于 1 M USD（图中未标出数值）\n\n"
-                            f"占比1%以上：{joined_names(above_one_percent)}\n\n"
-                            f"占比低于1%：{joined_names(below_one_percent)}"
-                        )
                         worksheet.insert_textbox(
                             20,
-                            chart_start_column + 14,
-                            legend_text,
+                            chart_start_column + 10,
+                            f"总可用库存金额\n{total_text}",
                             {
-                                "width": 330,
-                                "height": 330,
+                                "width": 180,
+                                "height": 75,
                                 "font": {"size": 10, "color": "#44546A"},
                                 "fill": {"color": "#FFFFFF", "transparency": 100},
                                 "line": {"none": True},
@@ -634,18 +817,99 @@ class InventoryStructureAnalyzer:
                             20,
                             len(frame.columns) + 1,
                             pie_chart,
-                            {"x_scale": 1.35, "y_scale": 1.2},
+                            {"x_scale": 1.35 * chart_scale, "y_scale": 1.2 * chart_scale},
                         )
 
-                if sheet_name == "国贸分类码分层" and len(frame) > 1:
-                    category_column = frame.columns.get_loc("库存分层分类")
+                if sheet_name == "国贸分类码L1汇总" and len(frame) > 1:
+                    category_column = frame.columns.get_loc("国贸产品分类码L1")
+                    amount_column = frame.columns.get_loc(SUMMARY_AMOUNT_COLUMN)
+                    last_category_row = len(frame) - 1
+                    share_labels: list[dict[str, object]] = []
+                    for _, category_row in frame.iloc[:-1].iterrows():
+                        amount = pd.to_numeric(category_row[SUMMARY_AMOUNT_COLUMN], errors="coerce")
+                        share = pd.to_numeric(category_row[SUMMARY_SHARE_COLUMN], errors="coerce")
+                        if pd.isna(amount) or pd.isna(share):
+                            share_labels.append({"delete": True})
+                        else:
+                            share_labels.append(
+                                {"value": f"{share:.1%}", "position": "outside_end", "font": {"size": 9}}
+                            )
+
+                    l1_bar_chart = workbook.add_chart({"type": "column"})
+                    l1_bar_chart.add_series(
+                        {
+                            "name": SUMMARY_AMOUNT_COLUMN,
+                            "categories": [sheet_name, 1, category_column, last_category_row, category_column],
+                            "values": [sheet_name, 1, amount_column, last_category_row, amount_column],
+                            "fill": {"color": "#2F75B5"},
+                            "data_labels": {"custom": share_labels},
+                        }
+                    )
+                    l1_bar_chart.set_title({"name": "国贸产品分类码L1库存金额"})
+                    l1_bar_chart.set_x_axis({"name": "国贸产品分类码L1", "label_position": "low"})
+                    l1_bar_chart.set_y_axis({"name": "库存金额（M USD）", "num_format": "0.00"})
+                    l1_bar_chart.set_legend({"none": True})
+                    worksheet.insert_chart(
+                        1,
+                        len(frame.columns) + 1,
+                        l1_bar_chart,
+                        {"x_scale": 1.55 * chart_scale, "y_scale": 1.3 * chart_scale},
+                    )
+
+                    l1_pie_chart = workbook.add_chart({"type": "pie"})
+                    pie_labels: list[dict[str, object]] = []
+                    for _, category_row in frame.iloc[:-1].iterrows():
+                        category = str(category_row["国贸产品分类码L1"])
+                        share = pd.to_numeric(category_row[SUMMARY_SHARE_COLUMN], errors="coerce")
+                        if pd.isna(share) or share <= 0:
+                            pie_labels.append({"delete": True})
+                        else:
+                            pie_labels.append(
+                                {
+                                    "value": f"{category}\n{share:.1%}" if share >= 0.01 else f"{share:.1%}",
+                                    "position": "center" if share >= 0.03 else "outside_end",
+                                    "font": {"size": 9 if share >= 0.03 else 8},
+                                }
+                            )
+                    l1_pie_chart.add_series(
+                        {
+                            "name": SUMMARY_AMOUNT_COLUMN,
+                            "categories": [sheet_name, 1, category_column, last_category_row, category_column],
+                            "values": [sheet_name, 1, amount_column, last_category_row, amount_column],
+                            "data_labels": {
+                                "custom": pie_labels,
+                                "leader_lines": True,
+                            },
+                        }
+                    )
+                    l1_pie_chart.set_title({"name": "国贸产品分类码L1库存金额占比"})
+                    l1_pie_chart.set_legend({"position": "right"})
+                    worksheet.insert_chart(
+                        20,
+                        len(frame.columns) + 1,
+                        l1_pie_chart,
+                        {"x_scale": 1.55 * chart_scale, "y_scale": 1.35 * chart_scale},
+                    )
+
+                if (
+                    sheet_name in trade_sheet_dimensions
+                    and trade_sheet_dimensions[sheet_name] in {
+                        "国贸产品分类码L2",
+                        "国贸产品分类码L3",
+                        "国贸产品分类码L4",
+                    }
+                    and sheet_name == self._trade_keys(trade_sheet_dimensions[sheet_name])[0]
+                    and len(frame) >= 1
+                ):
+                    trade_dimension = trade_sheet_dimensions[sheet_name]
+                    category_column = frame.columns.get_loc(trade_dimension)
                     amount_column = frame.columns.get_loc(SUMMARY_AMOUNT_COLUMN)
                     model_count_column = frame.columns.get_loc("型号数量")
-                    last_tier_row = len(frame) - 1
+                    last_category_row = len(frame)
                     share_labels: list[dict[str, object]] = []
-                    for _, tier_row in frame.iloc[:-1].iterrows():
-                        amount = pd.to_numeric(tier_row[SUMMARY_AMOUNT_COLUMN], errors="coerce")
-                        share = pd.to_numeric(tier_row[SUMMARY_SHARE_COLUMN], errors="coerce")
+                    for _, category_row in frame.iterrows():
+                        amount = pd.to_numeric(category_row[SUMMARY_AMOUNT_COLUMN], errors="coerce")
+                        share = pd.to_numeric(category_row[SUMMARY_SHARE_COLUMN], errors="coerce")
                         if pd.isna(amount) or pd.isna(share):
                             share_labels.append({"delete": True})
                         else:
@@ -656,26 +920,32 @@ class InventoryStructureAnalyzer:
                     pivot_chart = workbook.add_chart({"type": "column"})
                     pivot_chart.add_series(
                         {
-                            "name": SUMMARY_AMOUNT_COLUMN,
-                            "categories": [sheet_name, 1, category_column, last_tier_row, category_column],
-                            "values": [sheet_name, 1, amount_column, last_tier_row, amount_column],
-                            "fill": {"color": "#5B9BD5"},
+                            "name": "库存金额（柱形）",
+                            "categories": [sheet_name, 1, category_column, last_category_row, category_column],
+                            "values": [sheet_name, 1, amount_column, last_category_row, amount_column],
+                            "fill": {"color": "#2F75B5"},
                             "data_labels": {"custom": share_labels},
                         }
                     )
                     model_chart = workbook.add_chart({"type": "line"})
                     model_chart.add_series(
                         {
-                            "name": "型号数量",
-                            "categories": [sheet_name, 1, category_column, last_tier_row, category_column],
-                            "values": [sheet_name, 1, model_count_column, last_tier_row, model_count_column],
+                            "name": "型号数量（点）",
+                            "categories": [sheet_name, 1, category_column, last_category_row, category_column],
+                            "values": [sheet_name, 1, model_count_column, last_category_row, model_count_column],
                             "y2_axis": True,
-                            "line": {"color": "#ED7D31", "width": 2},
-                            "marker": {"type": "circle", "size": 5},
+                            "line": {"none": True},
+                            "marker": {
+                                "type": "diamond",
+                                "size": 7,
+                                "border": {"color": "#FFFFFF"},
+                                "fill": {"color": "#ED7D31"},
+                            },
                         }
                     )
                     pivot_chart.combine(model_chart)
-                    pivot_chart.set_title({"name": "库存分层透视图"})
+                    pivot_chart.set_title({"name": f"{trade_dimension}累计前80%分类透视图"})
+                    pivot_chart.set_x_axis({"name": trade_dimension, "label_position": "low"})
                     pivot_chart.set_y_axis({"name": "库存金额（M USD）", "num_format": "0.00"})
                     pivot_chart.set_y2_axis({"name": "型号数量", "num_format": "#,##0"})
                     pivot_chart.set_legend({"position": "bottom"})
@@ -683,12 +953,73 @@ class InventoryStructureAnalyzer:
                         1,
                         len(frame.columns) + 1,
                         pivot_chart,
-                        {"x_scale": 1.65, "y_scale": 1.35},
+                        {"x_scale": 1.75 * chart_scale, "y_scale": 1.4 * chart_scale},
                     )
 
-                if sheet_name == "按国贸分类码汇总" and len(frame) >= 1:
-                    category_column = frame.columns.get_loc("国贸产品分类码")
+                if (
+                    sheet_name in trade_sheet_dimensions
+                    and trade_sheet_dimensions[sheet_name] == "国贸产品分类码"
+                    and sheet_name == self._trade_keys("国贸产品分类码")[0]
+                    and len(frame) > 1
+                ):
+                    category_column = frame.columns.get_loc("库存分层分类")
                     amount_column = frame.columns.get_loc(SUMMARY_AMOUNT_COLUMN)
+                    model_count_column = frame.columns.get_loc("型号数量")
+                    last_tier_row = len(frame) - 1
+                    legacy_share_labels: list[dict[str, object]] = []
+                    for _, tier_row in frame.iloc[:-1].iterrows():
+                        share = pd.to_numeric(tier_row[SUMMARY_SHARE_COLUMN], errors="coerce")
+                        legacy_share_labels.append(
+                            {"delete": True}
+                            if pd.isna(share)
+                            else {
+                                "value": f"{share:.1%}",
+                                "position": "outside_end",
+                                "font": {"size": 9},
+                            }
+                        )
+                    legacy_chart = workbook.add_chart({"type": "column"})
+                    legacy_chart.add_series(
+                        {
+                            "name": "库存金额（柱形）",
+                            "categories": [sheet_name, 1, category_column, last_tier_row, category_column],
+                            "values": [sheet_name, 1, amount_column, last_tier_row, amount_column],
+                            "fill": {"color": "#2F75B5"},
+                            "data_labels": {"custom": legacy_share_labels},
+                        }
+                    )
+                    legacy_model_chart = workbook.add_chart({"type": "line"})
+                    legacy_model_chart.add_series(
+                        {
+                            "name": "型号数量（点）",
+                            "categories": [sheet_name, 1, category_column, last_tier_row, category_column],
+                            "values": [sheet_name, 1, model_count_column, last_tier_row, model_count_column],
+                            "y2_axis": True,
+                            "line": {"none": True},
+                            "marker": {
+                                "type": "diamond",
+                                "size": 7,
+                                "fill": {"color": "#ED7D31"},
+                            },
+                        }
+                    )
+                    legacy_chart.combine(legacy_model_chart)
+                    legacy_chart.set_title({"name": "国贸产品分类码库存分层透视图"})
+                    legacy_chart.set_y_axis({"name": "库存金额（M USD）", "num_format": "0.00"})
+                    legacy_chart.set_y2_axis({"name": "型号数量", "num_format": "#,##0"})
+                    legacy_chart.set_legend({"position": "bottom"})
+                    worksheet.insert_chart(
+                        1,
+                        len(frame.columns) + 1,
+                        legacy_chart,
+                        {"x_scale": 1.75 * chart_scale, "y_scale": 1.4 * chart_scale},
+                    )
+
+                if sheet_name in trade_sheet_dimensions and sheet_name == self._trade_keys(trade_sheet_dimensions[sheet_name])[1] and len(frame) >= 1:
+                    trade_dimension = trade_sheet_dimensions[sheet_name]
+                    category_column = frame.columns.get_loc(trade_dimension)
+                    amount_column = frame.columns.get_loc(SUMMARY_AMOUNT_COLUMN)
+                    model_count_column = frame.columns.get_loc("型号数量")
                     cumulative_column = frame.columns.get_loc("累计占比")
                     cumulative = pd.to_numeric(frame["累计占比"], errors="coerce")
                     reaches_eighty = cumulative.ge(0.8)
@@ -698,6 +1029,72 @@ class InventoryStructureAnalyzer:
                         else int(cumulative.notna().sum())
                     )
                     if cutoff:
+                        if trade_dimension in {
+                            "国贸产品分类码L2",
+                            "国贸产品分类码L3",
+                            "国贸产品分类码L4",
+                        }:
+                            top_eighty_labels: list[dict[str, object]] = []
+                            for _, category_row in frame.iloc[:cutoff].iterrows():
+                                share = pd.to_numeric(
+                                    category_row[SUMMARY_SHARE_COLUMN], errors="coerce"
+                                )
+                                top_eighty_labels.append(
+                                    {"delete": True}
+                                    if pd.isna(share)
+                                    else {
+                                        "value": f"{share:.1%}",
+                                        "position": "outside_end",
+                                        "font": {"size": 9},
+                                    }
+                                )
+                            top_eighty_chart = workbook.add_chart({"type": "column"})
+                            top_eighty_chart.add_series(
+                                {
+                                    "name": "库存金额（柱形）",
+                                    "categories": [sheet_name, 1, category_column, cutoff, category_column],
+                                    "values": [sheet_name, 1, amount_column, cutoff, amount_column],
+                                    "fill": {"color": "#2F75B5"},
+                                    "data_labels": {"custom": top_eighty_labels},
+                                }
+                            )
+                            top_eighty_model_chart = workbook.add_chart({"type": "line"})
+                            top_eighty_model_chart.add_series(
+                                {
+                                    "name": "型号数量（点）",
+                                    "categories": [sheet_name, 1, category_column, cutoff, category_column],
+                                    "values": [sheet_name, 1, model_count_column, cutoff, model_count_column],
+                                    "y2_axis": True,
+                                    "line": {"none": True},
+                                    "marker": {
+                                        "type": "diamond",
+                                        "size": 7,
+                                        "border": {"color": "#FFFFFF"},
+                                        "fill": {"color": "#ED7D31"},
+                                    },
+                                }
+                            )
+                            top_eighty_chart.combine(top_eighty_model_chart)
+                            top_eighty_chart.set_title(
+                                {"name": f"{trade_dimension}累计前80%分类透视图"}
+                            )
+                            top_eighty_chart.set_x_axis(
+                                {"name": trade_dimension, "label_position": "low"}
+                            )
+                            top_eighty_chart.set_y_axis(
+                                {"name": "库存金额（M USD）", "num_format": "0.00"}
+                            )
+                            top_eighty_chart.set_y2_axis(
+                                {"name": "型号数量", "num_format": "#,##0"}
+                            )
+                            top_eighty_chart.set_legend({"position": "bottom"})
+                            worksheet.insert_chart(
+                                1,
+                                len(frame.columns) + 1,
+                                top_eighty_chart,
+                                {"x_scale": 2.1 * chart_scale, "y_scale": 1.45 * chart_scale},
+                            )
+
                         pareto_chart = workbook.add_chart({"type": "column"})
                         pareto_chart.add_series(
                             {
@@ -720,17 +1117,24 @@ class InventoryStructureAnalyzer:
                         )
                         pareto_chart.combine(cumulative_chart)
                         pareto_chart.set_title({"name": f"累计80%库存金额分类码（前{cutoff}项）"})
-                        pareto_chart.set_x_axis({"name": "国贸产品分类码", "label_position": "low"})
+                        pareto_chart.set_x_axis({"name": trade_dimension, "label_position": "low"})
                         pareto_chart.set_y_axis({"name": "可用库存金额（M USD）", "num_format": "0.00"})
                         pareto_chart.set_y2_axis(
                             {"name": "累计占比", "num_format": "0%", "min": 0, "max": 1}
                         )
                         pareto_chart.set_legend({"position": "bottom"})
                         worksheet.insert_chart(
-                            1,
+                            24
+                            if trade_dimension
+                            in {
+                                "国贸产品分类码L2",
+                                "国贸产品分类码L3",
+                                "国贸产品分类码L4",
+                            }
+                            else 1,
                             len(frame.columns) + 1,
                             pareto_chart,
-                            {"x_scale": 2.1, "y_scale": 1.45},
+                            {"x_scale": 2.1 * chart_scale, "y_scale": 1.45 * chart_scale},
                         )
         return output.getvalue()
 
