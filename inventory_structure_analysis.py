@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import re
+from colorsys import hls_to_rgb
 from dataclasses import dataclass
 from typing import BinaryIO, Hashable
 
@@ -18,6 +19,7 @@ DETAIL_COLUMNS = [
     "产品组描述",
     "国贸产品分类码",
     "当前库存等级",
+    "ABC等级",
     "目标库存月数",
     "当前可用库存",
     "在途+在产",
@@ -38,10 +40,29 @@ TRADE_CATEGORY_FIELDS = [
     "国贸产品分类码L4",
 ]
 
+STATUS_GROUPS = {
+    "NEW RELEASE (RECOMMEND)": ("NEW RELEASE (RECOMMEND)", "NEW RELEASE", "NEW"),
+    "NORMAL/PHASING OUT": ("NORMAL", "PHASING OUT", "NORMAL/PHASING OUT"),
+    "EOL": ("EOL",),
+}
+
+STATUS_SHEET_PREFIXES = {
+    "NEW RELEASE (RECOMMEND)": "新品推荐",
+    "NORMAL/PHASING OUT": "正常渐退",
+    "EOL": "停产",
+}
+
 SUMMARY_AMOUNT_COLUMN = "可用库存金额（M USD）"
 SUMMARY_SHARE_COLUMN = "库存金额占比"
 
-SHEET_NAMES = [
+
+def composition_chart_color(category: str, index: int) -> str:
+    """Use muted, repeatable colors in both web and Excel composition charts."""
+    hue = (0.58 + index * 0.61803398875) % 1
+    red, green, blue = hls_to_rgb(hue, 0.52, 0.40)
+    return f"#{round(red * 255):02X}{round(green * 255):02X}{round(blue * 255):02X}"
+
+LEGACY_SHEET_NAMES = [
     "库存24个月以上",
     "超目标库存",
     "正常及关注库存",
@@ -49,6 +70,15 @@ SHEET_NAMES = [
     "按产品组汇总",
     "国贸分类码分层",
     "按国贸分类码汇总",
+]
+
+SHEET_NAMES = [
+    "库存24个月以上", "超目标库存", "正常及关注库存", "无销量", "无库存等级",
+    "按产品状态汇总",
+    "新品推荐L1", "新品推荐L2", "新品推荐L3", "新品推荐L4",
+    "正常渐退L1", "正常渐退L2", "正常渐退L3", "正常渐退L4", "正常渐退ABC",
+    "停产L1", "停产L2", "停产L3", "停产L4",
+    "产品组分类明细",
 ]
 
 
@@ -78,6 +108,7 @@ class InventoryStructureAnalyzer:
         "国贸产品分类码L4": ["国贸产品分类码L4", "产品分类码L4"],
         "级别": ["级别", "层级", "level", "hierarchylevel"],
         "当前库存等级": ["当前库存等级", "currentstocklevel", "currentstockgrade"],
+        "ABC等级": ["泛欧ABC", "ABC等级", "ABC", "paneuropeabc"],
         "目标库存月数": ["库存月数", "目标库存月数", "targetinventorymonths", "targetmos"],
         "当前可用库存": ["当前可用库存", "可用库存", "availableinventory", "availablestock"],
         "在途+在产": ["在途+在产", "在途在产", "pipeline", "intransit+inproduction"],
@@ -124,7 +155,7 @@ class InventoryStructureAnalyzer:
             if candidates:
                 mapping[canonical] = candidates[0]
                 used.add(candidates[0])
-        optional_fields = {*TRADE_CATEGORY_FIELDS, "全供应链存销比", "销售组织"}
+        optional_fields = {*TRADE_CATEGORY_FIELDS, "全供应链存销比", "销售组织", "ABC等级"}
         missing = [name for name in self.FIELD_ALIASES if name not in mapping and name not in optional_fields]
         if missing:
             raise ValueError("Replenishment 表缺少必要字段：" + "、".join(missing))
@@ -213,14 +244,14 @@ class InventoryStructureAnalyzer:
             raise ValueError("无法识别价格表中的物料代码列或单价列，请在页面中手动选择。")
 
         detail = pd.DataFrame({name: replenishment[column] for name, column in field_map.items()})
-        trade_dimensions = (
-            ["国贸产品分类码"]
-            if "国贸产品分类码" in field_map
-            else [name for name in TRADE_CATEGORY_FIELDS[1:] if name in field_map]
-        )
+        trade_dimensions = [name for name in TRADE_CATEGORY_FIELDS[1:] if name in field_map]
+        if not trade_dimensions:
+            trade_dimensions = ["国贸产品分类码"]
         detail_columns = self._detail_columns(trade_dimensions)
         if "销售组织" not in detail.columns:
             detail["销售组织"] = pd.NA
+        if "ABC等级" not in detail.columns:
+            detail["ABC等级"] = pd.NA
         if "全供应链存销比" not in detail.columns:
             detail["全供应链存销比"] = np.nan
         source_record_count = len(detail)
@@ -291,6 +322,10 @@ class InventoryStructureAnalyzer:
         normal = detail.loc[detail["库存区间"].eq("正常及关注库存")]
         problems = detail.loc[detail["库存区间"].eq("数据问题")]
         views["正常及关注库存"] = pd.concat([self._sorted(normal), self._sorted(problems)], ignore_index=True)
+        no_sales = detail["有效预测月销"].isna() | detail["有效预测月销"].le(0)
+        no_stock_level = detail["当前库存等级"].isna() | detail["当前库存等级"].astype("string").str.strip().eq("").fillna(False)
+        views["无销量"] = self._sorted(detail.loc[no_sales])
+        views["无库存等级"] = self._sorted(detail.loc[no_stock_level])
         views = {name: frame[detail_columns].copy() for name, frame in views.items()}
 
         summaries = {
@@ -345,6 +380,12 @@ class InventoryStructureAnalyzer:
         summary_amount_musd = summaries["按产品状态汇总"].iloc[-1][SUMMARY_AMOUNT_COLUMN]
         summary_amount = summary_amount_musd * 1_000_000
         amounts_match = (pd.isna(detail_amount) and pd.isna(summary_amount)) or bool(np.isclose(detail_amount, summary_amount))
+        inventory_bands = ["库存24个月以上", "超目标库存", "正常及关注库存", "数据问题"]
+        band_amounts = {
+            band: float(amount) if pd.notna(amount) else np.nan
+            for band in inventory_bands
+            for amount in [detail.loc[detail["库存区间"].eq(band), "可用库存金额"].sum(min_count=1)]
+        }
         diagnostics = {
             "源文件记录数": int(source_record_count),
             "纳入Parent记录数": int(len(detail)),
@@ -356,6 +397,7 @@ class InventoryStructureAnalyzer:
             "超目标库存数量": int(detail.loc[detail["库存区间"].eq("超目标库存"), "_物料键"].nunique(dropna=True)),
             "正常及关注库存数量": int(detail.loc[detail["库存区间"].eq("正常及关注库存"), "_物料键"].nunique(dropna=True)),
             "数据问题数量": int(detail.loc[detail["库存区间"].eq("数据问题"), "_物料键"].nunique(dropna=True)),
+            "库存区间金额": band_amounts,
             "有效明细金额": float(detail_amount) if pd.notna(detail_amount) else np.nan,
             "汇总金额核对一致": amounts_match,
             "国贸分类维度": tuple(trade_dimensions),
@@ -371,6 +413,209 @@ class InventoryStructureAnalyzer:
     @staticmethod
     def _sorted(frame: pd.DataFrame) -> pd.DataFrame:
         return frame.sort_values("可用库存存销比", ascending=False, na_position="last", kind="stable").reset_index(drop=True)
+
+    @staticmethod
+    def _status_rows(detail: pd.DataFrame, status: str) -> pd.DataFrame:
+        normalized = detail["产品状态"].astype("string").str.upper().str.replace(r"[^A-Z0-9]+", "", regex=True)
+        accepted = STATUS_GROUPS.get(status, (status,))
+        targets = {re.sub(r"[^A-Z0-9]+", "", value.upper()) for value in accepted}
+        return detail.loc[normalized.isin(targets)].copy()
+
+    def summarize_status_trade(
+        self, detail: pd.DataFrame, status: str, dimension: str,
+        selected_groups: list[str] | None = None,
+    ) -> pd.DataFrame:
+        source = self._status_rows(detail, status)
+        if dimension not in source.columns:
+            return pd.DataFrame(columns=[dimension, SUMMARY_AMOUNT_COLUMN, SUMMARY_SHARE_COLUMN, "型号数量"])
+        source["产品组描述"] = source["产品组描述"].astype("string").str.strip().fillna("").replace("", "未分类")
+        if selected_groups is not None:
+            source = source.loc[source["产品组描述"].isin(selected_groups)].copy()
+        source[dimension] = source[dimension].astype("string").str.strip().fillna("").replace("", "未分类")
+        source["_物料键"] = source["物料"].map(self._material_key)
+        grouped = source.groupby(dimension, dropna=False, sort=False).agg(
+            amount=("可用库存金额", lambda values: values.sum(min_count=1)),
+            型号数量=("_物料键", lambda values: values.nunique(dropna=True)),
+        ).reset_index()
+        total = source["可用库存金额"].sum(min_count=1)
+        grouped[SUMMARY_SHARE_COLUMN] = grouped["amount"] / total if pd.notna(total) and total != 0 else np.nan
+        grouped[SUMMARY_AMOUNT_COLUMN] = grouped.pop("amount") / 1_000_000
+        return grouped.sort_values(SUMMARY_AMOUNT_COLUMN, ascending=False, na_position="last", kind="stable").reset_index(drop=True)
+
+    def summarize_status_inventory(
+        self, detail: pd.DataFrame, status: str, selected_groups: list[str]
+    ) -> pd.DataFrame:
+        source = self._status_rows(detail, status)
+        source["产品组描述"] = source["产品组描述"].astype("string").str.strip().fillna("").replace("", "未分类")
+        source = source.loc[source["产品组描述"].isin(selected_groups)].copy()
+        source["ABC等级"] = source["ABC等级"].astype("string").str.strip().str.upper()
+        source = source.loc[source["ABC等级"].isin(["A", "B", "C"])]
+        source = source.loc[source["库存区间"].isin(["库存24个月以上", "超目标库存", "正常及关注库存"])]
+        source["_物料键"] = source["物料"].map(self._material_key)
+        grouped = source.groupby(["产品组描述", "ABC等级", "库存区间"], sort=False).agg(
+            amount=("可用库存金额", lambda values: values.sum(min_count=1)),
+            型号数量=("_物料键", lambda values: values.nunique(dropna=True)),
+        ).reset_index()
+        grouped[SUMMARY_AMOUNT_COLUMN] = grouped.pop("amount") / 1_000_000
+        return grouped
+
+    def available_product_groups(self, detail: pd.DataFrame, status: str) -> list[str]:
+        source = self._status_rows(detail, status)
+        groups = source["产品组描述"].astype("string").str.strip().fillna("").replace("", "未分类")
+        return sorted(groups.unique().tolist())
+
+    def summarize_status_overview(self, detail: pd.DataFrame) -> pd.DataFrame:
+        total_amount = detail["可用库存金额"].sum(min_count=1)
+        rows: list[dict[str, object]] = []
+        matched_indices: set[int] = set()
+        for status in STATUS_GROUPS:
+            source = self._status_rows(detail, status)
+            matched_indices.update(source.index.tolist())
+            amount = source["可用库存金额"].sum(min_count=1) if len(source) else 0.0
+            rows.append({
+                "产品状态类别": status,
+                SUMMARY_AMOUNT_COLUMN: amount / 1_000_000 if pd.notna(amount) else np.nan,
+                "型号数量": source["物料"].map(self._material_key).nunique(dropna=True),
+            })
+        other = detail.loc[~detail.index.isin(matched_indices)]
+        if not other.empty:
+            amount = other["可用库存金额"].sum(min_count=1)
+            rows.append({
+                "产品状态类别": "其他状态",
+                SUMMARY_AMOUNT_COLUMN: amount / 1_000_000 if pd.notna(amount) else np.nan,
+                "型号数量": other["物料"].map(self._material_key).nunique(dropna=True),
+            })
+        summary = pd.DataFrame(rows)
+        summary[SUMMARY_SHARE_COLUMN] = (
+            summary[SUMMARY_AMOUNT_COLUMN] / (total_amount / 1_000_000)
+            if pd.notna(total_amount) and total_amount != 0 else np.nan
+        )
+        total = pd.DataFrame([{
+            "产品状态类别": "合计",
+            SUMMARY_AMOUNT_COLUMN: total_amount / 1_000_000 if pd.notna(total_amount) else np.nan,
+            "型号数量": detail["物料"].map(self._material_key).nunique(dropna=True),
+            SUMMARY_SHARE_COLUMN: 1.0 if pd.notna(total_amount) and total_amount != 0 else np.nan,
+        }])
+        return pd.concat([summary, total], ignore_index=True)[
+            ["产品状态类别", SUMMARY_AMOUNT_COLUMN, SUMMARY_SHARE_COLUMN, "型号数量"]
+        ]
+
+    def summarize_status_group_trade(
+        self, detail: pd.DataFrame, status: str, dimension: str
+    ) -> pd.DataFrame:
+        source = self._status_rows(detail, status)
+        if dimension not in source.columns:
+            return pd.DataFrame(columns=["产品组描述", dimension, SUMMARY_AMOUNT_COLUMN, "型号数量"])
+        for column in ["产品组描述", dimension]:
+            source[column] = source[column].astype("string").str.strip().fillna("").replace("", "未分类")
+        source["_物料键"] = source["物料"].map(self._material_key)
+        grouped = source.groupby(["产品组描述", dimension], dropna=False, sort=False).agg(
+            amount=("可用库存金额", lambda values: values.sum(min_count=1)),
+            型号数量=("_物料键", lambda values: values.nunique(dropna=True)),
+        ).reset_index()
+        grouped[SUMMARY_AMOUNT_COLUMN] = grouped.pop("amount") / 1_000_000
+        return grouped.sort_values(
+            SUMMARY_AMOUNT_COLUMN, ascending=False, na_position="last", kind="stable"
+        ).reset_index(drop=True)
+
+    def summarize_all_status_group_trade(self, detail: pd.DataFrame) -> pd.DataFrame:
+        columns = ["产品状态类别", "产品组描述", "国贸分类码层级", "国贸产品分类码", "型号数量", SUMMARY_AMOUNT_COLUMN]
+        frames = []
+        for status in STATUS_GROUPS:
+            for level in range(1, 5):
+                dimension = f"国贸产品分类码L{level}"
+                if dimension not in detail.columns:
+                    if level == 1 and "国贸产品分类码" in detail.columns:
+                        dimension = "国贸产品分类码"
+                    else:
+                        continue
+                summary = self.summarize_status_group_trade(detail, status, dimension)
+                if summary.empty:
+                    continue
+                summary = summary.rename(columns={dimension: "国贸产品分类码"})
+                summary.insert(0, "产品状态类别", status)
+                summary.insert(2, "国贸分类码层级", f"L{level}")
+                frames.append(summary[columns])
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=columns)
+
+    def summarize_excel_status_trade(
+        self, detail: pd.DataFrame, status: str, dimension: str
+    ) -> pd.DataFrame:
+        columns = ["产品组", "产品组描述", dimension, SUMMARY_AMOUNT_COLUMN, "组内金额占比", "型号数量"]
+        source = self._status_rows(detail, status)
+        if dimension not in source.columns:
+            return pd.DataFrame(columns=columns)
+        for column in ["产品组", "产品组描述", dimension]:
+            source[column] = source[column].astype("string").str.strip().fillna("").replace("", "未分类")
+        source["_物料键"] = source["物料"].map(self._material_key)
+        grouped = source.groupby(["产品组", "产品组描述", dimension], dropna=False, sort=False).agg(
+            amount=("可用库存金额", lambda values: values.sum(min_count=1)),
+            型号数量=("_物料键", lambda values: values.nunique(dropna=True)),
+        ).reset_index()
+        grouped[SUMMARY_AMOUNT_COLUMN] = grouped.pop("amount") / 1_000_000
+        group_amount = grouped.groupby(["产品组", "产品组描述"], dropna=False)[SUMMARY_AMOUNT_COLUMN].transform(
+            lambda values: values.sum(min_count=1)
+        )
+        grouped["组内金额占比"] = np.where(
+            group_amount.notna() & group_amount.ne(0), grouped[SUMMARY_AMOUNT_COLUMN] / group_amount, np.nan
+        )
+        grouped["_产品组正金额"] = grouped.groupby(["产品组", "产品组描述"], dropna=False)[
+            SUMMARY_AMOUNT_COLUMN
+        ].transform(lambda values: values.clip(lower=0).sum())
+        grouped["_编号数值"] = pd.to_numeric(grouped["产品组"], errors="coerce")
+        return grouped.sort_values(
+            ["_产品组正金额", "_编号数值", "产品组", SUMMARY_AMOUNT_COLUMN],
+            ascending=[False, True, True, False], na_position="last", kind="stable",
+        )[columns].reset_index(drop=True)
+
+    @classmethod
+    def build_status_group_composition(
+        cls, group_summary: pd.DataFrame, dimension: str
+    ) -> pd.DataFrame:
+        columns = ["产品组", "产品组描述"]
+        positive = group_summary.loc[group_summary[SUMMARY_AMOUNT_COLUMN].gt(0)].copy()
+        if positive.empty:
+            return pd.DataFrame(columns=columns)
+        category_amounts = positive.groupby(dimension, sort=False)[SUMMARY_AMOUNT_COLUMN].sum()
+        ranked_categories = category_amounts.sort_values(ascending=False, kind="stable").index.tolist()
+        pivot = positive.pivot_table(
+            index=columns, columns=dimension, values=SUMMARY_AMOUNT_COLUMN,
+            aggfunc="sum", fill_value=0, sort=False,
+        ).reset_index()
+        category_columns = [name for name in ranked_categories if name in pivot.columns]
+        pivot["_产品组正金额"] = pivot[category_columns].sum(axis=1)
+        pivot["_编号数值"] = pd.to_numeric(pivot["产品组"], errors="coerce")
+        return pivot.sort_values(
+            ["_产品组正金额", "_编号数值", "产品组"],
+            ascending=[False, True, True], na_position="last", kind="stable",
+        )[columns + category_columns].reset_index(drop=True)
+
+    def summarize_excel_status_inventory(self, detail: pd.DataFrame) -> pd.DataFrame:
+        """Keep product-group codes in the exported ABC table without changing web summaries."""
+        source = self._status_rows(detail, "NORMAL/PHASING OUT")
+        for column in ("产品组", "产品组描述"):
+            source[column] = source[column].astype("string").str.strip().fillna("").replace("", "未分类")
+        source["ABC等级"] = source["ABC等级"].astype("string").str.strip().str.upper()
+        source = source.loc[
+            source["ABC等级"].isin(["A", "B", "C"])
+            & source["库存区间"].isin(["库存24个月以上", "超目标库存", "正常及关注库存"])
+        ].copy()
+        source["_物料键"] = source["物料"].map(self._material_key)
+        grouped = source.groupby(["产品组", "产品组描述", "ABC等级", "库存区间"], sort=False).agg(
+            amount=("可用库存金额", lambda values: values.sum(min_count=1)),
+            型号数量=("_物料键", lambda values: values.nunique(dropna=True)),
+        ).reset_index()
+        grouped[SUMMARY_AMOUNT_COLUMN] = grouped.pop("amount") / 1_000_000
+        grouped["_产品组正金额"] = grouped.groupby(
+            ["ABC等级", "产品组", "产品组描述"], dropna=False
+        )[SUMMARY_AMOUNT_COLUMN].transform(lambda values: values.clip(lower=0).sum())
+        grouped["_编号数值"] = pd.to_numeric(grouped["产品组"], errors="coerce")
+        band_order = {"库存24个月以上": 0, "超目标库存": 1, "正常及关注库存": 2}
+        grouped["_库存区间顺序"] = grouped["库存区间"].map(band_order)
+        return grouped.sort_values(
+            ["ABC等级", "_产品组正金额", "_编号数值", "产品组", "_库存区间顺序"],
+            ascending=[True, False, True, True, True], na_position="last", kind="stable",
+        ).drop(columns=["_产品组正金额", "_编号数值", "_库存区间顺序"]).reset_index(drop=True)
 
     @staticmethod
     def _summarize(detail: pd.DataFrame, dimensions: list[str]) -> pd.DataFrame:
@@ -607,7 +852,256 @@ class InventoryStructureAnalyzer:
             },
         )
 
+    @staticmethod
+    def summarize_inventory_bands(result: InventoryAnalysisResult) -> pd.DataFrame:
+        diagnostics = result.diagnostics
+        total = diagnostics["有效明细金额"]
+        rows = []
+        for band in ["库存24个月以上", "超目标库存", "正常及关注库存", "数据问题"]:
+            amount = diagnostics["库存区间金额"][band]
+            rows.append({
+                "库存区间": band,
+                "物料数量": diagnostics[f"{band}数量"],
+                SUMMARY_AMOUNT_COLUMN: amount / 1_000_000 if pd.notna(amount) else np.nan,
+                SUMMARY_SHARE_COLUMN: amount / total if pd.notna(amount) and pd.notna(total) and total != 0 else np.nan,
+            })
+        rows.append({
+            "库存区间": "合计",
+            "物料数量": diagnostics["记录数"],
+            SUMMARY_AMOUNT_COLUMN: total / 1_000_000 if pd.notna(total) else np.nan,
+            SUMMARY_SHARE_COLUMN: 1.0 if pd.notna(total) and total != 0 else np.nan,
+        })
+        return pd.DataFrame(rows)
+
     def export_excel(self, result: InventoryAnalysisResult) -> bytes:
+        """Export the inventory page's detail and status based summary views."""
+        output = io.BytesIO()
+        detail_sheets = ["库存24个月以上", "超目标库存", "正常及关注库存", "无销量", "无库存等级"]
+        status_sheet = "按产品状态汇总"
+        grade_sheet = "正常渐退ABC"
+        status_level_sheets = {
+            f"{prefix}L{level}": (status, f"国贸产品分类码L{level}")
+            for status, prefix in STATUS_SHEET_PREFIXES.items()
+            for level in range(1, 5)
+        }
+        frames: dict[str, pd.DataFrame] = {name: result.views[name].copy() for name in detail_sheets}
+        frames[status_sheet] = self.summarize_status_overview(result.detail)
+        for sheet_name, (status, dimension) in status_level_sheets.items():
+            if dimension in result.detail.columns:
+                frames[sheet_name] = self.summarize_excel_status_trade(result.detail, status, dimension)
+            elif dimension.endswith("L1") and "国贸产品分类码" in result.detail.columns:
+                status_level_sheets[sheet_name] = (status, "国贸产品分类码")
+                frames[sheet_name] = self.summarize_excel_status_trade(result.detail, status, "国贸产品分类码")
+            else:
+                frames[sheet_name] = pd.DataFrame({"提示": [f"源文件未提供{dimension}"]})
+        frames[grade_sheet] = self.summarize_excel_status_inventory(result.detail)
+        group_detail_sheet = "产品组分类明细"
+        frames[group_detail_sheet] = self.summarize_all_status_group_trade(result.detail)
+        sheet_names = [*detail_sheets, status_sheet]
+        for status, prefix in STATUS_SHEET_PREFIXES.items():
+            sheet_names.extend(f"{prefix}L{level}" for level in range(1, 5))
+            if status == "NORMAL/PHASING OUT":
+                sheet_names.append(grade_sheet)
+        sheet_names.append(group_detail_sheet)
+
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            workbook = writer.book
+            header_format = workbook.add_format({
+                "bold": True, "font_color": "white", "bg_color": "#1F4E78",
+                "border": 1, "align": "center",
+            })
+            amount_format = workbook.add_format({"num_format": "#,##0.00"})
+            quantity_format = workbook.add_format({"num_format": "#,##0"})
+            ratio_format = workbook.add_format({"num_format": "0.00"})
+            percent_format = workbook.add_format({"num_format": "0.00%"})
+            warning_format = workbook.add_format({"bg_color": "#FFF2CC"})
+            note_format = workbook.add_format({"font_color": "#44546A", "text_wrap": True})
+            chart_scale = 2 / 3
+            for sheet_name in sheet_names:
+                frame = frames[sheet_name]
+                header_row = 1 if sheet_name == group_detail_sheet else 0
+                frame.to_excel(writer, sheet_name=sheet_name, index=False, startrow=header_row + 1, header=False)
+                worksheet = writer.sheets[sheet_name]
+                worksheet.hide_gridlines(2)
+                worksheet.freeze_panes(header_row + 1, 0)
+                worksheet.autofilter(header_row, 0, header_row + max(len(frame), 1), len(frame.columns) - 1)
+                if sheet_name == group_detail_sheet:
+                    worksheet.merge_range(
+                        0, 0, 0, len(frame.columns) - 1,
+                        "每行汇总一个产品状态类别、产品组和国贸分类码层级下的一个分类码。型号数量为去重物料数；金额单位为 M USD。L1–L4 是不同口径，不要跨层级相加。",
+                        note_format,
+                    )
+                    worksheet.set_row(0, 34)
+                for column_index, column in enumerate(frame.columns):
+                    worksheet.write(header_row, column_index, column, header_format)
+                    values = frame[column].astype(str).replace("nan", "")
+                    width = min(max(len(str(column)) * 2, int(values.map(len).quantile(0.95) if len(values) else 0) + 2), 38)
+                    column_format = None
+                    if column in {"可用库存存销比", "全供应链存销比", "目标库存月数", "有效预测月销", "单价"}:
+                        column_format = ratio_format
+                    elif column in {"当前可用库存", "在途+在产", "型号数量", "物料数量", "分类码数量", "排名"}:
+                        column_format = quantity_format
+                    elif column in {"可用库存金额", SUMMARY_AMOUNT_COLUMN}:
+                        column_format = amount_format
+                    elif column in {SUMMARY_SHARE_COLUMN, "组内金额占比"}:
+                        column_format = percent_format
+                    worksheet.set_column(column_index, column_index, width, column_format)
+
+                if sheet_name != status_sheet and SUMMARY_AMOUNT_COLUMN in frame.columns:
+                    amount_column = frame.columns.get_loc(SUMMARY_AMOUNT_COLUMN)
+                    for row_index, amount in enumerate(frame[SUMMARY_AMOUNT_COLUMN], start=header_row + 1):
+                        if pd.notna(amount):
+                            worksheet.write_number(row_index, amount_column, float(amount), amount_format)
+
+                if "计算状态" in frame.columns and len(frame):
+                    status_letter = self._excel_column(frame.columns.get_loc("计算状态"))
+                    worksheet.conditional_format(
+                        1, 0, len(frame), len(frame.columns) - 1,
+                        {"type": "formula", "criteria": f'=${status_letter}2<>"正常"', "format": warning_format},
+                    )
+
+                if sheet_name == status_sheet:
+                    positive = frame.iloc[:-1].loc[frame.iloc[:-1][SUMMARY_AMOUNT_COLUMN].gt(0)]
+                    helper_column = len(frame.columns) + 2
+                    worksheet.write(0, helper_column, "产品状态类别", header_format)
+                    worksheet.write(0, helper_column + 1, SUMMARY_AMOUNT_COLUMN, header_format)
+                    for row_index, (_, row) in enumerate(positive.iterrows(), start=1):
+                        worksheet.write(row_index, helper_column, row["产品状态类别"])
+                        worksheet.write_number(row_index, helper_column + 1, row[SUMMARY_AMOUNT_COLUMN], amount_format)
+                    if len(positive):
+                        pie = workbook.add_chart({"type": "pie"})
+                        pie.add_series({
+                            "name": SUMMARY_AMOUNT_COLUMN,
+                            "categories": [sheet_name, 1, helper_column, len(positive), helper_column],
+                            "values": [sheet_name, 1, helper_column + 1, len(positive), helper_column + 1],
+                            "data_labels": {"category": True, "percentage": True, "position": "best_fit"},
+                        })
+                        pie.set_title({"name": "按产品状态概览"})
+                        pie.set_legend({"position": "right"})
+                        worksheet.insert_chart(1, helper_column + 3, pie, {
+                            "x_scale": 1.5 * chart_scale, "y_scale": 1.25 * chart_scale,
+                        })
+
+                if sheet_name in status_level_sheets and SUMMARY_AMOUNT_COLUMN in frame.columns:
+                    status, dimension = status_level_sheets[sheet_name]
+                    worksheet.write(0, len(frame.columns) + 2, f"{status} · {dimension}：产品组内分类码构成")
+                    if len(frame):
+                        pivot = self.build_status_group_composition(frame, dimension)
+                        if pivot.empty:
+                            worksheet.write(2, len(frame.columns) + 2, "没有可绘图的正库存金额。")
+                        else:
+                            category_columns = list(pivot.columns[2:])
+                            positive_total = pivot[category_columns].to_numpy(dtype=float).sum()
+                            group_totals = pivot[category_columns].sum(axis=1)
+                            pivot.insert(2, "图表产品组标签", [
+                                f"{description}（{amount / positive_total:.1%}）"
+                                for description, amount in zip(pivot["产品组描述"], group_totals)
+                            ])
+                            pivot_header_row = 0
+                            first_pivot_row = pivot_header_row + 1
+                            last_pivot_row = pivot_header_row + len(pivot)
+                            helper_start_column = max(30, len(frame.columns) + 20)
+                            for column_index, column in enumerate(pivot.columns):
+                                worksheet.write(pivot_header_row, helper_start_column + column_index, column, header_format)
+                            for row_index, row in enumerate(pivot.itertuples(index=False, name=None), start=first_pivot_row):
+                                for column_index, value in enumerate(row):
+                                    if column_index < 3:
+                                        worksheet.write(row_index, helper_start_column + column_index, value)
+                                    else:
+                                        worksheet.write_number(row_index, helper_start_column + column_index, float(value), amount_format)
+                            worksheet.set_column(
+                                helper_start_column, helper_start_column + len(pivot.columns) - 1,
+                                None, None, {"hidden": True},
+                            )
+                            chart = workbook.add_chart({"type": "bar", "subtype": "percent_stacked"})
+                            chart.show_hidden_data()
+                            for column_index in range(3, len(pivot.columns)):
+                                category = str(pivot.columns[column_index])
+                                chart.add_series({
+                                    "name": [sheet_name, pivot_header_row, helper_start_column + column_index],
+                                    "categories": [sheet_name, first_pivot_row, helper_start_column + 2, last_pivot_row, helper_start_column + 2],
+                                    "values": [sheet_name, first_pivot_row, helper_start_column + column_index, last_pivot_row, helper_start_column + column_index],
+                                    "fill": {"color": composition_chart_color(category, column_index - 3)},
+                                })
+                            chart.set_title({"none": True})
+                            chart.set_x_axis({"num_format": "0%"})
+                            chart.set_y_axis({"reverse": True})
+                            plot_height = int(max(340, 27 * len(pivot) + 100) * chart_scale)
+                            legend_rows = (len(category_columns) + 1) // 2
+                            legend_height = max(80, 22 * legend_rows + 20)
+                            chart_height = plot_height + legend_height + 80
+                            chart.set_plotarea({"layout": {
+                                "x": 0.24, "y": 0.04, "width": 0.72,
+                                "height": (plot_height - 30) / chart_height,
+                            }})
+                            chart.set_legend({
+                                "position": "bottom", "font": {"size": 8},
+                                "layout": {
+                                    "x": 0.06, "y": (plot_height + 45) / chart_height,
+                                    "width": 0.90, "height": legend_height / chart_height,
+                                },
+                            })
+                            chart.set_size({
+                                "width": int(960 * chart_scale),
+                                "height": chart_height,
+                            })
+                            worksheet.insert_chart(2, len(frame.columns) + 2, chart)
+
+                if sheet_name == grade_sheet and len(frame):
+                    bands = ["库存24个月以上", "超目标库存", "正常及关注库存"]
+                    colors = ["#D95F5F", "#F2B34D", "#4C9E91"]
+                    helper_column = len(frame.columns) + 2
+                    chart_column = helper_column + 6
+                    start_row = 0
+                    for grade in "ABC":
+                        grade_data = frame.loc[frame["ABC等级"].eq(grade)]
+                        groups = grade_data[["产品组", "产品组描述"]].drop_duplicates().itertuples(index=False, name=None)
+                        groups = list(groups)
+                        if not groups:
+                            continue
+                        grade_positive_total = grade_data[SUMMARY_AMOUNT_COLUMN].clip(lower=0).sum()
+                        worksheet.write(start_row, helper_column, f"{grade}级产品组")
+                        for offset, heading in enumerate(["产品组", "产品组描述（占比）", *bands]):
+                            worksheet.write(start_row + 1, helper_column + offset, heading, header_format)
+                        for group_index, (group_code, group_description) in enumerate(groups):
+                            data_row = start_row + 2 + group_index
+                            worksheet.write(data_row, helper_column, group_code)
+                            group_rows = grade_data.loc[
+                                grade_data["产品组"].eq(group_code)
+                                & grade_data["产品组描述"].eq(group_description)
+                            ]
+                            group_positive = group_rows[SUMMARY_AMOUNT_COLUMN].clip(lower=0).sum()
+                            group_share = group_positive / grade_positive_total if grade_positive_total > 0 else 0.0
+                            worksheet.write(data_row, helper_column + 1, f"{group_description}（{group_share:.1%}）")
+                            for band_index, band in enumerate(bands):
+                                matching = grade_data.loc[
+                                    grade_data["产品组"].eq(group_code)
+                                    & grade_data["产品组描述"].eq(group_description)
+                                    & grade_data["库存区间"].eq(band),
+                                    SUMMARY_AMOUNT_COLUMN,
+                                ]
+                                value = matching.sum(min_count=1) if len(matching) else 0.0
+                                if pd.notna(value):
+                                    worksheet.write_number(data_row, helper_column + band_index + 2, float(value), amount_format)
+                        chart = workbook.add_chart({"type": "bar", "subtype": "stacked"})
+                        for band_index, band in enumerate(bands):
+                            chart.add_series({
+                                "name": band,
+                                "categories": [sheet_name, start_row + 2, helper_column + 1, start_row + 1 + len(groups), helper_column + 1],
+                                "values": [sheet_name, start_row + 2, helper_column + band_index + 2, start_row + 1 + len(groups), helper_column + band_index + 2],
+                                "fill": {"color": colors[band_index]},
+                            })
+                        chart.set_title({"name": f"{grade}级产品组库存水位"})
+                        chart.set_x_axis({"name": "可用库存金额（M USD）", "num_format": "#,##0.00"})
+                        chart.set_y_axis({"name": "产品组", "reverse": True})
+                        chart.set_legend({"position": "bottom"})
+                        chart_height = int(max(420, 34 * len(groups) + 100) * chart_scale)
+                        chart.set_size({"width": int(760 * chart_scale), "height": chart_height})
+                        worksheet.insert_chart(start_row, chart_column, chart)
+                        start_row += max(len(groups) + 2, (chart_height + 19) // 20) + 5
+        return output.getvalue()
+
+    def _export_legacy_excel(self, result: InventoryAnalysisResult) -> bytes:
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
             workbook = writer.book
@@ -625,7 +1119,7 @@ class InventoryStructureAnalyzer:
             frames = {**result.views, **result.summaries}
             trade_dimensions = list(result.diagnostics.get("国贸分类维度", ("国贸产品分类码",)))
             trade_sheet_dimensions: dict[str, str] = {}
-            sheet_names = SHEET_NAMES[:5].copy()
+            sheet_names = LEGACY_SHEET_NAMES[:5].copy()
             for dimension in trade_dimensions:
                 if dimension == "国贸产品分类码L1":
                     sheet_names.append("国贸分类码L1汇总")

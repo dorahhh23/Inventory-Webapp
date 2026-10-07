@@ -13,9 +13,10 @@ from inventory_structure_analysis import (
     SUMMARY_AMOUNT_COLUMN,
     SUMMARY_SHARE_COLUMN,
     InventoryStructureAnalyzer,
+    composition_chart_color,
 )
 
-INVENTORY_ANALYSIS_CACHE_VERSION = "product-group-share-labels-v14"
+INVENTORY_ANALYSIS_CACHE_VERSION = "status-trade-levels-v17"
 
 
 @st.cache_data(show_spinner="正在读取并分析工作簿…")
@@ -790,6 +791,197 @@ def show_trade_category_analysis(
                 show_trade_category_dimension(summaries, diagnostics, dimension)
 
 
+def show_status_trade_analysis(result, status: str, dimension: str, selected_groups: list[str]) -> None:
+    analyzer = InventoryStructureAnalyzer()
+    selected_detail = result.detail.loc[
+        result.detail["产品组描述"].astype("string").str.strip().fillna("").replace("", "未分类").isin(selected_groups)
+    ]
+    summary = analyzer.summarize_excel_status_trade(selected_detail, status, dimension)
+    st.caption(f"按产品组和{dimension}汇总；金额单位：M USD。图中显示所有具有正库存金额的分类码，不再合并为“其他分类码”。")
+    if summary.empty:
+        st.info(f"没有产品状态为 {status} 的记录。")
+        return
+    st.dataframe(
+        summary.style.format({SUMMARY_AMOUNT_COLUMN: "{:,.2f}", "组内金额占比": "{:.2%}"}, na_rep=""),
+        width="content",
+        hide_index=True,
+    )
+    pivot = analyzer.build_status_group_composition(summary, dimension)
+    if pivot.empty:
+        st.info("没有可绘图的正库存金额；负金额和缺失金额仍保留在上方表格中。")
+        return
+    category_columns = list(pivot.columns[2:])
+    group_amounts = pivot[category_columns].sum(axis=1)
+    total_amount = group_amounts.sum()
+    labels = [
+        f"{description}（{amount / total_amount:.1%}）"
+        for description, amount in zip(pivot["产品组描述"], group_amounts)
+    ]
+    chart = go.Figure()
+    for index, category in enumerate(category_columns):
+        chart.add_trace(go.Bar(
+            name=str(category),
+            x=pivot[category] / group_amounts,
+            y=labels,
+            orientation="h",
+            marker_color=composition_chart_color(str(category), index),
+            customdata=pivot[category],
+            hovertemplate="产品组：%{y}<br>分类码：" + str(category)
+            + "<br>组内占比：%{x:.1%}<br>库存金额：%{customdata:,.2f} M USD<extra></extra>",
+        ))
+    chart.update_layout(
+        barmode="stack",
+        height=max(360, 38 * len(pivot) + 180, 18 * min(len(category_columns), 30) + 80),
+        margin=dict(l=180, r=270, t=45, b=70),
+        xaxis=dict(title="库存金额构成占比", tickformat=".0%", range=[0, 1]),
+        yaxis=dict(title="产品组", autorange="reversed"),
+        legend=dict(
+            title="分类码", orientation="v", x=1.02, xanchor="left",
+            y=1, yanchor="top", maxheight=0.88,
+        ),
+        title=f"{status} · {dimension}：产品组内分类码构成",
+    )
+    st.plotly_chart(chart, use_container_width=True, config={"displayModeBar": False}, key=f"status-trade-{status}-{dimension}")
+
+
+def show_status_inventory_analysis(result, status: str, selected_groups: list[str]) -> None:
+    analyzer = InventoryStructureAnalyzer()
+    selected_detail = result.detail.loc[
+        result.detail["产品组描述"].astype("string").str.strip().fillna("").replace("", "未分类").isin(selected_groups)
+    ]
+    summary = analyzer.summarize_excel_status_inventory(selected_detail)
+    st.caption("按泛欧ABC等级展示三种库存水位；未填写ABC等级或无法归入库存区间的记录不进入此图。库存金额单位：M USD。")
+    if summary.empty:
+        st.info("所选产品组没有可展示的 A/B/C 库存区间记录。")
+        return
+    colors = {"库存24个月以上": "#d95f5f", "超目标库存": "#f2b34d", "正常及关注库存": "#4c9e91"}
+    for grade_tab, grade in zip(st.tabs(["A级", "B级", "C级"]), ["A", "B", "C"]):
+        with grade_tab:
+            grade_data = summary.loc[summary["ABC等级"].eq(grade)]
+            if grade_data.empty:
+                st.info(f"所选产品组没有 {grade} 级库存记录。")
+                continue
+            st.dataframe(
+                grade_data.style.format({SUMMARY_AMOUNT_COLUMN: "{:,.2f}"}, na_rep=""),
+                width="content",
+                hide_index=True,
+            )
+            chart = go.Figure()
+            displayed_groups = grade_data[["产品组", "产品组描述"]].drop_duplicates().itertuples(index=False, name=None)
+            displayed_groups = list(displayed_groups)
+            grade_positive_total = grade_data[SUMMARY_AMOUNT_COLUMN].clip(lower=0).sum()
+            group_labels = []
+            for code, description in displayed_groups:
+                group_rows = grade_data.loc[
+                    grade_data["产品组"].eq(code) & grade_data["产品组描述"].eq(description)
+                ]
+                group_positive = group_rows[SUMMARY_AMOUNT_COLUMN].clip(lower=0).sum()
+                share = group_positive / grade_positive_total if grade_positive_total > 0 else 0.0
+                group_labels.append(f"{description}（{share:.1%}）")
+            for band, color in colors.items():
+                values = []
+                counts = []
+                for code, description in displayed_groups:
+                    matching = grade_data.loc[
+                        grade_data["产品组"].eq(code)
+                        & grade_data["产品组描述"].eq(description)
+                        & grade_data["库存区间"].eq(band)
+                    ]
+                    amount = matching[SUMMARY_AMOUNT_COLUMN].sum(min_count=1)
+                    values.append(float(amount) if pd.notna(amount) else 0.0)
+                    counts.append(int(matching["型号数量"].sum()))
+                chart.add_trace(go.Bar(
+                    name=band,
+                    x=values,
+                    y=group_labels,
+                    orientation="h",
+                    marker_color=color,
+                    customdata=counts,
+                    hovertemplate="产品组：%{y}<br>库存金额：%{x:,.2f} M USD<br>型号数量：%{customdata:,}<extra></extra>",
+                ))
+            chart.update_layout(
+                barmode="stack",
+                height=max(400, 44 * len(displayed_groups) + 100),
+                margin=dict(l=160, r=40, t=25, b=60),
+                xaxis_title="可用库存金额（M USD）",
+                yaxis=dict(title="产品组", autorange="reversed"),
+                legend_title="库存水位",
+            )
+            st.plotly_chart(chart, use_container_width=True, config={"displayModeBar": False}, key=f"status-inventory-{status}-{grade}")
+
+
+def show_product_status_analysis(result) -> None:
+    analyzer = InventoryStructureAnalyzer()
+    status_names = ["NEW RELEASE (RECOMMEND)", "NORMAL/PHASING OUT", "EOL"]
+    trade_levels = [f"国贸产品分类码L{level}" for level in range(1, 5)]
+    for tab, status in zip(st.tabs(status_names), status_names):
+        with tab:
+            groups = analyzer.available_product_groups(result.detail, status)
+            if not groups:
+                st.info(f"没有产品状态为 {status} 的记录。")
+                continue
+            selected_groups = st.multiselect(
+                "产品组描述（默认全部）",
+                groups,
+                default=groups,
+                key=f"inventory-groups-{status}",
+            )
+            if not selected_groups:
+                st.info("请选择至少一个产品组。")
+                continue
+            labels = ["L1", "L2", "L3", "L4"]
+            if status == "NORMAL/PHASING OUT":
+                labels.append("A/B/C库存等级")
+            for analysis_tab, label in zip(st.tabs(labels), labels):
+                with analysis_tab:
+                    if label == "A/B/C库存等级":
+                        show_status_inventory_analysis(result, status, selected_groups)
+                        continue
+                    dimension = trade_levels[int(label[1]) - 1]
+                    if dimension not in result.detail.columns:
+                        if label == "L1" and "国贸产品分类码" in result.detail.columns:
+                            st.caption("源文件未提供 L1；此处使用原“国贸产品分类码”字段。")
+                            dimension = "国贸产品分类码"
+                        else:
+                            st.info(f"源文件未提供{dimension}，无法展示该层级。")
+                            continue
+                    show_status_trade_analysis(result, status, dimension, selected_groups)
+
+
+def show_status_overview(result) -> None:
+    summary = InventoryStructureAnalyzer().summarize_status_overview(result.detail)
+    st.markdown("#### 按产品状态概览")
+    table_column, pie_column = st.columns([1, 1], gap="large")
+    with table_column:
+        st.dataframe(
+            summary.style.format(
+                {SUMMARY_AMOUNT_COLUMN: "{:,.2f}", SUMMARY_SHARE_COLUMN: "{:.2%}"}, na_rep=""
+            ),
+            width="content",
+            hide_index=True,
+        )
+    with pie_column:
+        chart_data = summary.iloc[:-1].loc[summary.iloc[:-1][SUMMARY_AMOUNT_COLUMN].gt(0)]
+        if chart_data.empty:
+            st.info("没有可用于饼图的正库存金额。")
+        else:
+            pie = go.Figure(go.Pie(
+                labels=chart_data["产品状态类别"],
+                values=chart_data[SUMMARY_AMOUNT_COLUMN],
+                textinfo="label+percent",
+                textposition="auto",
+                hovertemplate="%{label}<br>库存金额：%{value:,.2f} M USD<br>占比：%{percent:.2%}<extra></extra>",
+            ))
+            pie.update_layout(
+                height=340,
+                margin=dict(l=20, r=20, t=15, b=20),
+                legend=dict(orientation="h", y=-0.1),
+            )
+            st.plotly_chart(pie, use_container_width=True, config={"displayModeBar": False}, key="inventory-status-overview")
+            if summary.iloc[:-1][SUMMARY_AMOUNT_COLUMN].lt(0).any():
+                st.caption("负库存金额保留在表格中，不绘入饼图。")
+
+
 def render_inventory_page() -> None:
     st.title("库存结构分析")
     st.caption("按可用库存覆盖月数识别长期库存、超目标库存及正常/关注库存，并按产品维度汇总库存金额。")
@@ -900,17 +1092,22 @@ def render_inventory_page() -> None:
         ("数据问题数量", diagnostics["数据问题数量"]),
     ]
     for column, (label, value) in zip(st.columns(4), inventory_metrics):
+        band = label.removesuffix("数量")
+        band_amount = diagnostics["库存区间金额"][band]
+        share_text = "—" if pd.isna(band_amount) or pd.isna(amount) or amount == 0 else f"{band_amount / amount:.2%}"
         column.metric(label, f"{value:,}")
+        column.metric("金额（M USD）", "—" if pd.isna(band_amount) else f"{band_amount / 1_000_000:,.2f}")
+        column.metric("占比", share_text)
     st.caption("数据问题包括：  \n"
         "有效预测月销缺失或小于等于 0、当前可用库存缺失，"
         "以及存销比低于 24 个月但目标库存月数缺失，导致库存覆盖或区间无法可靠计算。"
     )
     st.markdown("### 4. 库存区间明细")
 
-    names = ["库存24个月以上", "超目标库存", "正常及关注库存"]
+    names = ["库存24个月以上", "超目标库存", "正常及关注库存", "无销量", "无库存等级"]
     for tab, name in zip(st.tabs(names), names):
         with tab:
-            with st.expander(f"展开查看{name}明细", expanded=False):
+            with st.expander(f"展开查看{name}明细（{len(result.views[name]):,} 条）", expanded=False):
                 web_detail = result.views[name].drop(columns=["销售组织"], errors="ignore")
                 st.dataframe(
                     web_detail.style.format(precision=2, na_rep=""),
@@ -919,14 +1116,13 @@ def render_inventory_page() -> None:
                 )
                 if name == "正常及关注库存":
                     st.caption("无法计算存销比的记录标记为“数据问题”，并显示在表格最后。")
+                elif name == "无销量":
+                    st.caption("有效预测月销缺失或小于等于 0；价格缺失不影响本表的筛选。")
+                elif name == "无库存等级":
+                    st.caption("当前库存等级为空；价格缺失不影响本表的筛选。")
     st.markdown("### 5. 汇总分析")
-    status_tab, group_tab, category_tab = st.tabs(["Product Status", "Product Group", "国贸产品分类码"])
-    with status_tab:
-        show_inventory_summary("按 Product Status分类", result.summaries["按产品状态汇总"], "product_status")
-    with group_tab:
-        show_inventory_summary("按 Product Group分类", result.summaries["按产品组汇总"], "product_group")
-    with category_tab:
-        show_trade_category_analysis(result.summaries, diagnostics)
+    show_status_overview(result)
+    show_product_status_analysis(result)
     st.markdown("### 6. 导出")
     st.download_button(
         "下载库存结构分析结果 (.xlsx)", data=InventoryStructureAnalyzer().export_excel(result),
